@@ -21,7 +21,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Login is a remembered subscription account, without its secrets.
@@ -123,6 +126,10 @@ func writeLogins(ls []savedLogin) error {
 // writePrivate replaces a file readable by the user alone, atomically, so
 // an agent reading it at that moment sees either version, never half.
 func writePrivate(path string, b []byte) error {
+	path, err := edit.Target(path) // a symlink stays, its target written
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -142,7 +149,7 @@ func writePrivate(path string, b []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return steady.Rename(tmp.Name(), path)
 }
 
 func upsertLogin(ls []savedLogin, l savedLogin) []savedLogin {
@@ -339,8 +346,10 @@ func claudeSignedInUser(plan, statusPlan, status string) (user string, acct map[
 // none.
 func savedButSignedOut() []Exclusion {
 	saved := map[string]int{}
+	users := map[string][]string{}
 	for _, l := range readLogins() {
 		saved[l.Agent]++
+		users[l.Agent] = append(users[l.Agent], l.User)
 	}
 	var out []Exclusion
 	for _, a := range loginAgents {
@@ -358,7 +367,7 @@ func savedButSignedOut() []Exclusion {
 		if saved[a] > 1 {
 			n = fmt.Sprintf("%d accounts are", saved[a])
 		}
-		out = append(out, Exclusion{Agent: a, SignedOut: true,
+		out = append(out, Exclusion{Agent: a, SignedOut: true, Users: users[a],
 			Why: fmt.Sprintf("%s saved in magpie, but it isn't signed in here (%s), and they are only offered beside the account it is signed in to. Sign in (%s) with this HOME.", n, why, signIn)})
 	}
 	return out
@@ -473,6 +482,9 @@ func rememberLogins(force bool) {
 // Logins lists the remembered accounts of an agent ("" for every one),
 // the active one flagged.
 func Logins(agent string) []Login {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return pluginLoginList(pp)
+	}
 	var side []Login
 	switch agent {
 	case "grok":
@@ -489,8 +501,8 @@ func Logins(agent string) []Login {
 		return wbLoginList(wbSiteOf(agent))
 	case CommandCodePlanID:
 		return cmdLoginList()
-	case "qoder":
-		return loginsOf(qoderLogins())
+	case "qoder", QoderCNID:
+		return loginsOf(qoderLoginsOf(agent))
 	case "zed":
 		return zedLoginList()
 	case "factory":
@@ -500,19 +512,43 @@ func Logins(agent string) []Login {
 	case "gemini", "antigravity":
 		return googleLoginList(agent)
 	case "":
-		side = append(grokLoginList(), copilotLoginList()...)
-		side = append(side, zcodeLoginList()...)
-		side = append(side, kiroLoginList()...)
-		side = append(side, devinLoginList()...)
-		side = append(side, wbLoginList(wbCN)...)
-		side = append(side, wbLoginList(wbAI)...)
-		side = append(side, cmdLoginList()...)
-		side = append(side, loginsOf(qoderLogins())...)
-		side = append(side, zedLoginList()...)
-		side = append(side, factoryLoginList()...)
-		side = append(side, mimoLoginList()...)
-		side = append(side, googleLoginList("gemini")...)
-		side = append(side, googleLoginList("antigravity")...)
+		// a plugin's accounts go by its provider's id (a moved built-in's
+		// by the built-in's), the one in use first marked, as its own page
+		// lists them
+		byPlugin := map[string][]Login{}
+		for _, pp := range plugin.Cached() {
+			for _, l := range pluginLoginList(pp) {
+				l.Agent = PluginID(pp.ID)
+				byPlugin[pp.ID] = append(byPlugin[pp.ID], l)
+			}
+		}
+		// a built-in moved onto its plugin lists its accounts there (an
+		// agent's own sign-in, which the built-in still finds, too)
+		for _, b := range []struct {
+			id   string
+			list func() []Login
+		}{
+			{"grok", grokLoginList}, {"copilot", copilotLoginList}, {"zcode", zcodeLoginList}, {"kiro", kiroLoginList},
+			{"devin", devinLoginList}, {"workbuddy", func() []Login { return wbLoginList(wbCN) }},
+			{WorkBuddyAIID, func() []Login { return wbLoginList(wbAI) }}, {CommandCodePlanID, cmdLoginList},
+			{"qoder", func() []Login { return loginsOf(qoderLogins()) }},
+			{QoderCNID, func() []Login { return loginsOf(qoderLoginsOf(QoderCNID)) }}, {"zed", zedLoginList}, {"factory", factoryLoginList},
+			{MiMoID, mimoLoginList}, {"gemini", func() []Login { return googleLoginList("gemini") }},
+			{"antigravity", func() []Login { return googleLoginList("antigravity") }},
+		} {
+			if !Moved(b.id) {
+				side = append(side, b.list()...)
+				continue
+			}
+			// a moved built-in's, from its plugin, where the built-in's stood
+			side = append(side, byPlugin[b.id]...)
+			delete(byPlugin, b.id)
+		}
+		// the other plugins' after them
+		for _, pp := range plugin.Cached() {
+			side = append(side, byPlugin[pp.ID]...)
+			delete(byPlugin, pp.ID)
+		}
 	}
 	rememberLogins(false)
 	loginsMu.Lock()
@@ -526,7 +562,7 @@ func Logins(agent string) []Login {
 	var out []Login
 	ls := readLogins()
 	for _, l := range ls {
-		if (agent != "" && l.Agent != agent) || sideAgent(l.Agent) {
+		if (agent != "" && l.Agent != agent) || sideAgent(l.Agent) || strings.HasPrefix(l.Agent, "plugin:") {
 			continue
 		}
 		using := strings.EqualFold(active[l.Agent], l.User)
@@ -540,11 +576,35 @@ func Logins(agent string) []Login {
 	return append(out, side...)
 }
 
+// InUseLogin is the account of an agent's the gateway goes to first: the
+// one the agent is signed in to, unless it is paused, else the first other
+// one on; "" when the agent has none.
+func InUseLogin(agent string) string {
+	return inUseOf(Logins(agent))
+}
+
+func inUseOf(ls []Login) string {
+	for _, l := range ls {
+		if l.Active && !l.Paused {
+			return l.User
+		}
+	}
+	for _, l := range ls {
+		if l.On && !l.Paused {
+			return l.User
+		}
+	}
+	return ""
+}
+
 // SwitchLogin signs an agent in to a remembered account. Sessions of the
 // agent that are already running keep the account they started with until
 // they restart; so does Codex's background app-server, which new Codex
 // sessions attach to (CodexDaemonStale says when it is).
 func SwitchLogin(agent, user string) error {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return switchPluginLogin(pp, user)
+	}
 	switch agent {
 	case "grok":
 		return switchGrokLogin(user)
@@ -560,8 +620,8 @@ func SwitchLogin(agent, user string) error {
 		return switchWorkBuddyLogin(wbSiteOf(agent), user)
 	case CommandCodePlanID:
 		return switchCommandCodeLogin(user)
-	case "qoder":
-		return switchSideLogin("qoder", user, qoderLogins())
+	case "qoder", QoderCNID:
+		return switchSideLogin(agent, user, qoderLoginsOf(agent))
 	case "zed":
 		return switchZedLogin(user)
 	case "factory":
@@ -685,6 +745,9 @@ func putClaudeLogin(l savedLogin) error {
 // ForgetLogin drops a remembered account. The one an agent is signed in to
 // now can't be forgotten; it would only be remembered again.
 func ForgetLogin(agent, user string) error {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return forgetPluginLogin(pp, user)
+	}
 	switch agent {
 	case "grok":
 		return forgetGrokLogin(user)
@@ -700,8 +763,8 @@ func ForgetLogin(agent, user string) error {
 		return forgetWorkBuddyLogin(wbSiteOf(agent), user)
 	case CommandCodePlanID:
 		return forgetCommandCodeLogin(user)
-	case "qoder":
-		return forgetQoderLogin(user)
+	case "qoder", QoderCNID:
+		return forgetQoderLogin(agent, user)
 	case "zed":
 		return forgetZedLogin(user)
 	case "factory":

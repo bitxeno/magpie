@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -35,11 +36,27 @@ func TestPluginProvider(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var got []seen
+	limited := "" // the Authorization answered 429
+	refused := "" // and 401
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		got = append(got, seen{r.URL.RequestURI(), r.Header.Get("Authorization"), r.Header.Get("X-Plugin-Model"), string(b)})
+		out := limited != "" && r.Header.Get("Authorization") == limited
+		gone := refused != "" && r.Header.Get("Authorization") == refused
 		mu.Unlock()
+		if gone {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprint(w, `{"error":{"message":"token expired"}}`)
+			return
+		}
+		if out {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(429)
+			fmt.Fprint(w, `{"error":{"message":"rate limited"}}`)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch {
 		case r.URL.Path == "/v1/chat/completions":
@@ -77,7 +94,7 @@ func TestPluginProvider(t *testing.T) {
 	if _, err := provider.Find("fakeco"); err == nil {
 		t.Fatal("fakeco is a provider before it is signed in to")
 	}
-	if _, err := plugin.APIKey(ctx, "fakeco", 0, nil, "k1"); err != nil {
+	if _, err := plugin.APIKey(ctx, "fakeco", 0, nil, "k1", plugin.NewAccount); err != nil {
 		t.Fatal(err)
 	}
 	p, err := provider.Find("fakeco")
@@ -112,7 +129,77 @@ func TestPluginProvider(t *testing.T) {
 		}
 	}
 
-	if err := plugin.SignOut(ctx, "fakeco"); err != nil {
+	// the vendor refuses the first account's sign-in: it shows lapsed, as a
+	// built-in's does, until a request on it goes through again
+	lapsed := func() string {
+		for _, l := range provider.Logins("fakeco") {
+			if l.Active {
+				return l.Lapsed
+			}
+		}
+		return "?"
+	}
+	mu.Lock()
+	refused = "Bearer k1"
+	mu.Unlock()
+	postAs(t, s, "", `{"model":"fakeco/fake-1","messages":[{"role":"user","content":"hello"}]}`)
+	if l := lapsed(); !strings.Contains(l, "sign-in has expired") {
+		t.Fatalf("the refused account's mark: %q", l)
+	}
+	mu.Lock()
+	refused = ""
+	mu.Unlock()
+	for i := 0; i < 3 && lapsed() != ""; i++ {
+		postAs(t, s, "", `{"model":"fakeco/fake-1","messages":[{"role":"user","content":"hello"}]}`)
+	}
+	if l := lapsed(); l != "" {
+		t.Fatalf("the mark stayed after a request went through: %q", l)
+	}
+
+	// a second account: the first rate limited, a request goes on the second
+	if _, err := provider.PluginAPIKey(ctx, "fakeco", 0, nil, "k2"); err != nil {
+		t.Fatal(err)
+	}
+	if ls := provider.Logins("fakeco"); len(ls) != 2 || !ls[1].On {
+		t.Fatalf("accounts %+v", ls)
+	}
+	mu.Lock()
+	limited = "Bearer k1"
+	mu.Unlock()
+	var staled []string
+	staleAllowance = func(agent, user string) {
+		mu.Lock()
+		staled = append(staled, agent)
+		mu.Unlock()
+		provider.StaleAllowance(agent, user)
+	}
+	defer func() { staleAllowance = provider.StaleAllowance }()
+	code, body := postAs(t, s, "", `{"model":"fakeco/fake-1","messages":[{"role":"user","content":"hello"}]}`)
+	mu.Lock()
+	last := got[len(got)-1]
+	mu.Unlock()
+	if code != 200 || !strings.Contains(body, "hi from chat") || last.auth != "Bearer k2" {
+		t.Fatalf("with the first account limited: %d %s, upstream saw %+v", code, body, last)
+	}
+	// the limited account's allowance is asked again as its usage is kept,
+	// and it rests as that account
+	mu.Lock()
+	asked := slices.Clone(staled)
+	mu.Unlock()
+	if !slices.Contains(asked, "plugin:fakeco") {
+		t.Fatalf("the limited account's allowance went stale as %q, not plugin:fakeco", asked)
+	}
+	restingUntil.Lock()
+	var rests []string
+	for _, r := range restingUntil.note {
+		rests = append(rests, r.agent)
+	}
+	restingUntil.Unlock()
+	if !slices.Contains(rests, "plugin:fakeco") {
+		t.Fatalf("the limited account rests as %q, not plugin:fakeco", rests)
+	}
+
+	if err := plugin.SignOut(ctx, "fakeco", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := provider.Find("fakeco"); err == nil {

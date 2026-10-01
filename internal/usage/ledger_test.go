@@ -10,6 +10,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // The ledger lists a period's calls newest first, each with the model
@@ -84,8 +85,8 @@ func TestLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := strings.Join(CSVHeader, ",") + "\n" +
-		rows[1].Time.Format(time.RFC3339) + ",codex,relay/sol,relay,relay.example,sol,sol-2026-01-01,false,,10,1,0,0,0,0.000028,100,,200,false,,\n" +
-		rows[2].Time.Format(time.RFC3339) + ",codex,fast,relay,relay.example,sol,luna,true,high,2000,500,1000,4000,0,0.012500,3200,400,200,false,s1,\n"
+		rows[1].Time.Format(time.RFC3339) + ",codex,relay/sol,relay,relay.example,sol,sol-2026-01-01,false,,10,1,0,0,0,0.000028,100,,200,false,,,,\n" +
+		rows[2].Time.Format(time.RFC3339) + ",codex,fast,relay,relay.example,sol,luna,true,high,2000,500,1000,4000,0,0.012500,3200,400,200,false,s1,,,\n"
 	if b.String() != want {
 		t.Fatalf("csv:\n%s\nwant:\n%s", b.String(), want)
 	}
@@ -151,6 +152,101 @@ func TestSubscriptionListPrice(t *testing.T) {
 	for _, m := range s.Models {
 		if m.Model != "mystery-1" && (m.Unpriced != 0 || m.Cost == 0) {
 			t.Errorf("model %s unpriced: %+v", m.ID, m.Totals)
+		}
+	}
+}
+
+// A call is counted at the price the user set for that provider and model,
+// all four token tiers included: the ledger is where a wrong price becomes a
+// wrong number, and a tier left at the catalogue's price would not show in
+// the input and output columns alone.
+func TestLedgerUsesTheStatedPrice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	os.WriteFile(catalog.CachePath(), []byte(`{"openai":{"id":"openai","models":{"sol":{"id":"sol",`+
+		`"cost":{"input":2,"output":8,"cache_read":0.5,"cache_write":2.5}}}}}`), 0o644)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "https://relay.example/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	// all four parts distinct from the catalogue's, so a tier counted at the
+	// catalogue's price instead would move the total
+	if err := settings.Save(settings.Settings{ModelPrices: map[string]settings.ModelPrice{
+		"relay/sol": {Input: new(float64(0.2)), Output: new(float64(1)),
+			CacheRead: new(float64(0.05)), CacheWrite: new(float64(0.25))},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Dir(Path()), 0o755)
+	Append(Record{Time: time.Now(), Agent: "codex", Provider: "relay", Host: "relay.example",
+		Model: "sol", Input: 1000, Output: 100, CacheRead: 2000, CacheWrite: 400, Status: 200})
+
+	rows, sum, _ := Ledger(Month, Filter{})
+	if len(rows) != 1 || !rows[0].Priced {
+		t.Fatalf("rows %+v", rows)
+	}
+	// (1000*0.2 + 100*1 + 2000*0.05 + 400*0.25) / 1e6
+	const want = 0.0005
+	if math.Abs(rows[0].Cost-want) > 1e-12 || math.Abs(sum.Cost-want) > 1e-12 {
+		t.Fatalf("row cost %v, total %v; want %v", rows[0].Cost, sum.Cost, want)
+	}
+}
+
+// A row is judged against the id the call went out under, which on an
+// Antigravity account is the variant of the model the effort picks and not
+// the family it is one level of: a reply naming that variant is the model
+// that was asked for, and a name given for the whole provider asks each
+// level by its own id, which is the very name the reply names back. Read
+// against the family instead, every level of it reads as another model
+// having swapped in — in a report a user sets beside a bill.
+func TestLedgerJudgesAnAntigravityCallByTheVariantItWentOutUnder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// Antigravity's ids of one model at three levels, as its fetch left them
+	var raw []catalog.Model
+	for _, id := range []string{"flash-9-low", "flash-9-medium", "flash-9-high"} {
+		raw = append(raw, catalog.Model{ID: id})
+	}
+	if err := catalog.SaveLive("antigravity", "", raw); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	if err := settings.Save(settings.Settings{ModelWires: map[string]string{"antigravity/*": "vendor-c/*"}}); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Dir(Path()), 0o755)
+	now := time.Now()
+	for i, c := range []struct{ effort, level string }{
+		{"high", "high"}, {"low", "low"},
+		// with no effort asked for the family thinks at its default, which is
+		// the highest of it
+		{"", "high"},
+	} {
+		Append(Record{Time: now.Add(time.Duration(i) * time.Minute), Provider: "antigravity",
+			Host: "antigravity.example", Model: "flash-9", Effort: c.effort,
+			Served: "vendor-c/flash-9-" + c.level, Input: 10, Output: 1, Status: 200})
+	}
+	// a level the call did not go out at is another model answering
+	Append(Record{Time: now.Add(4 * time.Minute), Provider: "antigravity",
+		Host: "antigravity.example", Model: "flash-9", Effort: "high",
+		Served: "vendor-c/flash-9-low", Input: 10, Output: 1, Status: 200})
+
+	rows, sum, _ := Ledger(All, Filter{})
+	if len(rows) != 4 || sum.Calls != 4 {
+		t.Fatalf("rows %d, %+v", len(rows), rows)
+	}
+	// newest first: the swap, then the three levels
+	if !rows[0].Swapped {
+		t.Errorf("a relay that answered with another level's id is read as no swap: %+v", rows[0])
+	}
+	for _, row := range rows[1:] {
+		if row.Swapped {
+			t.Errorf("the call went out at %q and was answered with %q, which is that very model: %+v", row.Effort, row.Served, row)
 		}
 	}
 }

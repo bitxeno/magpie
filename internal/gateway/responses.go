@@ -63,6 +63,7 @@ type rTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      *bool           `json:"strict,omitempty"`
 	Tools       []rTool         `json:"tools,omitempty"` // a namespace's
 	Execution   string          `json:"execution,omitempty"`
 }
@@ -124,19 +125,33 @@ type rRequest struct {
 	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
 	ServiceTier       string          `json:"service_tier,omitempty"`
 	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
+	Include           []string        `json:"include,omitempty"`
+	ClientMetadata    json.RawMessage `json:"client_metadata,omitempty"`
+	Text              json.RawMessage `json:"text,omitempty"`
 	Reasoning         *struct {
 		Effort  string `json:"effort,omitempty"`
 		Summary string `json:"summary,omitempty"`
 	} `json:"reasoning,omitempty"`
 }
 
+// sentRaw is a raw field the client sent, unless it sent null.
+func sentRaw(v json.RawMessage) json.RawMessage {
+	if t := strings.TrimSpace(string(v)); t == "" || t == "null" {
+		return nil
+	}
+	return v
+}
+
 func parseResponses(body []byte) (*Request, error) {
+	// Responses Lite's tools, sent as the first input item (#350)
+	body = liftAdditionalTools(body)
 	var q rRequest
 	if err := json.Unmarshal(body, &q); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: q.Model, System: q.Instructions, MaxTokens: q.MaxOutputTokens, Temp: q.Temperature,
-		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority", CacheKey: q.PromptCacheKey}
+		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority", CacheKey: q.PromptCacheKey, Include: q.Include,
+		ClientMetadata: sentRaw(q.ClientMetadata), Text: sentRaw(q.Text)}
 	if q.Reasoning != nil {
 		r.Effort = effortOf(q.Reasoning.Effort)
 		r.Thinking = true
@@ -191,9 +206,20 @@ func parseResponses(body []byte) (*Request, error) {
 				out, images := toolOutput(it.Output)
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: it.CallID, Text: out, Images: images}}})
 			case it.Type == "reasoning":
+				// the reasoning itself when the item carries it, else its
+				// summary (all magpie gives a client of a translated reply)
 				var b strings.Builder
-				for _, s := range it.Summary {
-					b.WriteString(s.Text)
+				var content []rText
+				_ = json.Unmarshal(it.Content, &content)
+				for _, c := range content {
+					if c.Type == "reasoning_text" {
+						b.WriteString(c.Text)
+					}
+				}
+				if b.Len() == 0 {
+					for _, s := range it.Summary {
+						b.WriteString(s.Text)
+					}
 				}
 				if b.Len() > 0 {
 					r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{{Kind: Thinking, Text: b.String()}}})
@@ -224,7 +250,7 @@ func parseResponses(body []byte) (*Request, error) {
 		}
 		switch t.Type {
 		case "function":
-			offer(i, Tool{Name: t.Name, Description: t.Description, Schema: t.Parameters}, nsTool{})
+			offer(i, Tool{Name: t.Name, Description: t.Description, Schema: t.Parameters, Strict: t.Strict != nil && *t.Strict}, nsTool{})
 		case "namespace":
 			// offered flat, as few models know namespaces; a call is given
 			// its namespace back on the way out
@@ -233,7 +259,7 @@ func parseResponses(body []byte) (*Request, error) {
 					continue
 				}
 				flat := flatName(t.Name, nt.Name)
-				offer(i, Tool{Name: flat, Description: nt.Description, Schema: nt.Parameters}, nsTool{Namespace: t.Name, Name: nt.Name})
+				offer(i, Tool{Name: flat, Description: nt.Description, Schema: nt.Parameters, Strict: nt.Strict != nil && *nt.Strict}, nsTool{Namespace: t.Name, Name: nt.Name})
 			}
 		case toolSearch:
 			if t.Execution == "client" {
@@ -343,6 +369,14 @@ func responsesParts(raw json.RawMessage) []Part {
 
 // buildResponses renders a request for a Responses upstream.
 func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
+	// A turn's reasoning goes back as a reasoning item, as a model that
+	// thinks between tool calls wants it (DeepSeek: "The reasoning_text in
+	// the thinking mode must be passed back", #388). Only a DeepSeek model
+	// gets it: OpenAI's and those in front of it read only their own
+	// sealed reasoning, and may refuse an item without it.
+	replay := strings.Contains(strings.ToLower(model), "deepseek") &&
+		!slices.Contains([]string{"chatgpt.com", "api.openai.com", "api.x.ai", "api.githubcopilot.com"}, host) &&
+		!strings.HasSuffix(host, ".openai.azure.com")
 	var input []map[string]any
 	for _, m := range r.Messages {
 		var content []map[string]any
@@ -370,6 +404,12 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 			case Image:
 				if m.Role != "assistant" {
 					content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(p)})
+				}
+			case Thinking:
+				if replay && p.Text != "" {
+					flushMsg()
+					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
+						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
 				}
 			case ToolCall:
 				flushMsg()
@@ -401,6 +441,12 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		input = []map[string]any{}
 	}
 	out := map[string]any{"model": model, "input": input, "stream": r.Stream, "store": false}
+	if len(r.ClientMetadata) > 0 {
+		out["client_metadata"] = r.ClientMetadata
+	}
+	if len(r.Text) > 0 {
+		out["text"] = r.Text
+	}
 	if r.CacheKey != "" {
 		out["prompt_cache_key"] = r.CacheKey
 	}
@@ -427,10 +473,26 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	} else if r.Thinking {
 		out["reasoning"] = map[string]any{"summary": "auto"}
 	}
+	// the client's include goes on as the request would have without
+	// magpie. Sealed reasoning is asked for only with reasoning, as Codex
+	// asks for it: OpenAI refuses it of a model that doesn't reason. What
+	// comes back sealed goes no further than magpie, and the input's sealed
+	// reasoning isn't sent on this way, so no account or vendor is handed
+	// another's to refuse (withoutRefused, sealedKinds, on a relay).
+	var include []string
+	for _, v := range r.Include {
+		if v == "" || slices.Contains(include, v) || (v == "reasoning.encrypted_content" && out["reasoning"] == nil) {
+			continue
+		}
+		include = append(include, v)
+	}
 	if len(r.Tools) > 0 || r.WebSearch {
 		var tools []map[string]any
 		for _, t := range r.Tools {
-			tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description}
+			// strict is said, as Codex says it: left out, the ChatGPT
+			// backend holds the schema to strict mode's rules and refuses a
+			// pattern with a lookaround (MiniMax Code's path, #383)
+			tool := map[string]any{"type": "function", "name": t.Name, "description": t.Description, "strict": t.Strict}
 			if len(t.Schema) > 0 {
 				tool["parameters"] = t.Schema
 			}
@@ -440,8 +502,8 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 			tools = append(tools, map[string]any{"type": "web_search"})
 			// the pages it found, which a client of another protocol is
 			// told of (OpenAI's option; xAI's API isn't known to take it)
-			if host != "api.x.ai" {
-				out["include"] = []string{"web_search_call.action.sources"}
+			if host != "api.x.ai" && !slices.Contains(include, "web_search_call.action.sources") {
+				include = append(include, "web_search_call.action.sources")
 			}
 		}
 		out["tools"] = tools
@@ -454,6 +516,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		if r.Parallel != nil {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
+	}
+	if len(include) > 0 {
+		out["include"] = include
 	}
 	b, _ := json.Marshal(out)
 	return b
@@ -549,7 +614,7 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		}
 	case "response.completed", "response.incomplete", "response.failed":
 		if ev.Response.Error != nil {
-			emit(Event{Kind: KError, Text: ev.Response.Error.Message})
+			emit(Event{Kind: KError, Text: ev.Response.Error.Message, Code: refusedCode(data)})
 			return nil
 		}
 		stop := "stop"
@@ -575,7 +640,7 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		if ev.Error != nil {
 			msg = ev.Error.Message
 		}
-		emit(Event{Kind: KError, Text: msg})
+		emit(Event{Kind: KError, Text: msg, Code: refusedCode(data)})
 	}
 	return nil
 }
@@ -627,11 +692,14 @@ func (e *responsesEncoder) send(typ string, fields map[string]any) {
 }
 
 func (e *responsesEncoder) response(status string, extra map[string]any) map[string]any {
-	out := map[string]any{"id": e.id, "object": "response", "created_at": e.created, "status": status,
-		"model": e.model, "output": e.output, "parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}}
-	if out["output"] == nil {
-		out["output"] = []any{}
+	// a list, never null, before any item: Muse Code refuses a stream whose
+	// response.created has output null (its nil slice in an any isn't nil)
+	output := e.output
+	if output == nil {
+		output = []map[string]any{}
 	}
+	out := map[string]any{"id": e.id, "object": "response", "created_at": e.created, "status": status,
+		"model": e.model, "output": output, "parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}}
 	for k, v := range extra {
 		out[k] = v
 	}
@@ -745,7 +813,11 @@ func (e *responsesEncoder) event(ev Event) {
 		}
 	case KError:
 		e.closeItem()
-		e.send("response.failed", map[string]any{"response": e.response("failed", map[string]any{"error": map[string]any{"code": "server_error", "message": ev.Text}})})
+		code := "server_error"
+		if ev.Code != "" {
+			code = ev.Code
+		}
+		e.send("response.failed", map[string]any{"response": e.response("failed", map[string]any{"error": map[string]any{"code": code, "message": ev.Text}})})
 	}
 	e.col.add(ev)
 }

@@ -1,10 +1,10 @@
 // Package sessions lists the agents' recent sessions from their own session
 // files — Claude Code's projects/*/<id>.jsonl (and Qoder's, the same kind),
 // Codex's rollout files, OpenCode's database (or its older JSON files) and
-// ZCode's, Pi's session files, DeepSeek Harness's, Cline's, Grok Build's and
-// WorkBuddy's — with the
-// tokens each spent, what that cost at list price, and the command that
-// resumes it. It only ever reads the agents' folders.
+// ZCode's, Pi's session files and omp's, DeepSeek Harness's, Cline's, Grok
+// Build's and WorkBuddy's — with the tokens each spent, what that cost at the
+// effective price, and the command that resumes it. It only ever reads the
+// agents' folders.
 //
 // The files grow long (hundreds of MB), so each one's parse is kept by path,
 // size and time, and a file that only grew is read on from where it was left.
@@ -31,6 +31,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Tokens is a count of tokens. Input excludes what was read from cache.
@@ -67,7 +68,7 @@ type Model struct {
 
 // Session is one agent session.
 type Session struct {
-	Agent  string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy
+	Agent  string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy
 	ID     string    `json:"id"`
 	Cwd    string    `json:"cwd"`
 	Title  string    `json:"title"` // the first prompt, else the agent's own title
@@ -75,13 +76,15 @@ type Session struct {
 	Last   time.Time `json:"last"`
 	Models []Model   `json:"models"`
 	Tokens
-	Cost     float64 `json:"cost"`     // USD at list price, for the priced models
+	Cost     float64 `json:"cost"`     // USD at the effective price, for the priced models
 	Unpriced int     `json:"unpriced"` // models that spent tokens but have no known price
 	Resume   string  `json:"resume"`   // the command that picks the session up again
 	Path     string  `json:"path"`     // its (main) file
 }
 
-// PriceOf is the list price of a model as a session names it. Tests swap it.
+// PriceOf is the effective price of a model as a session names it, at the
+// settings given. Tests swap it; the settings are the ones the listing read,
+// so a swapped one prices against the same copy as the default does.
 var PriceOf = priceOf
 
 // Limit is how many sessions, the latest by last activity, List reads.
@@ -131,7 +134,7 @@ type day struct {
 	// (24 of them, or none)
 	Hours []int64 `json:"h,omitempty"`
 	// Prompts are the messages typed in the session's own file, Replies
-	// the agent's messages back (Claude Code and Codex alone tell them)
+	// the agent's messages back (Claude Code's, Codex's, Pi's and omp's)
 	Prompts int `json:"u,omitempty"`
 	Replies int `json:"r,omitempty"`
 	// Tools are the tool calls made, by the tool's name, and Skills the
@@ -140,16 +143,19 @@ type day struct {
 	Skills map[string]int `json:"k,omitempty"`
 }
 
-// tool counts a call of a tool, and of a skill when it calls one up.
+// tool counts a call of a tool, and of a skill when it calls one up; a
+// skill called up with no tool (Pi's /skill:name) has no name.
 func (s *state) tool(at time.Time, name, skill string) {
-	if name == "" {
+	if name == "" && skill == "" {
 		return
 	}
 	d := s.day(dateOf(at))
-	if d.Tools == nil {
-		d.Tools = map[string]int{}
+	if name != "" {
+		if d.Tools == nil {
+			d.Tools = map[string]int{}
+		}
+		d.Tools[name]++
 	}
-	d.Tools[name]++
 	if skill != "" {
 		if d.Skills == nil {
 			d.Skills = map[string]int{}
@@ -340,7 +346,7 @@ func allFiles() []file {
 	var out []file
 	for _, fs := range [][]file{claudeFiles(), codexFiles(), openCodeFiles(), piFiles(),
 		zcodeFiles(), dshFiles(), clineFiles(), ccFiles("qoder", QoderDir("qoder")), ccFiles("qoder-cn", QoderDir("qoder-cn")),
-		grokFiles(), workbuddyFiles()} {
+		grokFiles(), workbuddyFiles(), ompFiles()} {
 		out = append(out, fs...)
 	}
 	return out
@@ -360,6 +366,7 @@ func Dirs() []string {
 		{QoderDir("qoder-cn"), filepath.Join(QoderDir("qoder-cn"), "projects")},
 		{GrokDir(), filepath.Join(GrokDir(), "sessions")},
 		{WorkBuddyDir(), filepath.Join(WorkBuddyDir(), "projects")},
+		{OmpDir(), filepath.Join(OmpDir(), "sessions")},
 	} {
 		if _, err := os.Stat(d.sessions); err == nil {
 			out = append(out, d.dir)
@@ -409,7 +416,8 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 3: the active time by hour of the day
 // 4: the tool calls and skills a day
 // 5: again, for the prompts and replies a day, which an early 4 left out
-const cacheVersion = 5
+// 6: Pi's and omp's prompts, replies, tool calls and skills
+const cacheVersion = 6
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -636,15 +644,22 @@ func offOf(f file) int64 {
 	return 0
 }
 
-// pricer looks up the price of each model once.
+// pricer looks up the price of each model once, out of one read of the
+// settings: a listing names the same handful of models over and over, and
+// each of them otherwise read the file and parsed it again. Every model is
+// priced against the copy read here, so a listing is one snapshot of the
+// prices rather than a reading per row, and a price changed while it is
+// read takes effect in the next listing rather than halfway through this
+// one.
 func pricer() func(string) *catalog.Price {
 	prices := map[string]*catalog.Price{}
+	s := settings.Load()
 	return func(model string) *catalog.Price {
 		if p, ok := prices[model]; ok {
 			return p
 		}
 		var pp *catalog.Price
-		if p, ok := PriceOf(model); ok {
+		if p, ok := PriceOf(s, model); ok {
 			pp = &p
 		}
 		prices[model] = pp
@@ -740,7 +755,7 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if first == "" {
 				first = st.First
 			}
-			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "dsh" || s.Agent == "grok") && st.ID != "" && f.path == fs[0].path {
+			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok") && st.ID != "" && f.path == fs[0].path {
 				s.ID = st.ID
 			}
 		}
@@ -815,7 +830,7 @@ func parse(f file, old *state) *state {
 	switch f.agent {
 	case "codex":
 		line = codexLine
-	case "pi":
+	case "pi", "omp":
 		line = piParse
 	case "workbuddy":
 		line = workbuddyLine
@@ -942,23 +957,23 @@ func title(s string) string {
 var dated = regexp.MustCompile(`-\d{8}$`)
 
 // priceOf prices a model as a session names it: one through magpie as
-// "<provider>/<model>" at the price the gateway counts it at, else the bare
-// id at its maker's list price on models.dev.
-func priceOf(model string) (catalog.Price, bool) {
+// "<provider>/<model>" at the price the gateway counts it at — what the user
+// set for that provider and model, else that provider's own list price, else
+// its maker's on models.dev — and a bare id only ever at its maker's, which is
+// a different question from what one provider charges.
+//
+// The settings are the ones passed in rather than read here: a listing reads
+// them once and prices every model of it against that same copy, so a
+// listing is one snapshot of the prices and reads the file once, not once
+// per model.
+func priceOf(s settings.Settings, model string) (catalog.Price, bool) {
 	m := strings.TrimSpace(model)
 	if m == "" {
 		return catalog.Price{}, false
 	}
 	if pid, rest, ok := strings.Cut(m, "/"); ok {
-		for _, p := range provider.All() {
-			if p.ID == pid {
-				for _, c := range p.Catalogs() {
-					if pr, ok := catalog.PriceOf(c, rest); ok {
-						return pr, true
-					}
-				}
-				break
-			}
+		if pr, ok := provider.EffectivePriceIn(s, pid, rest); ok {
+			return pr, true
 		}
 	}
 	bare := strings.ToLower(m[strings.LastIndexByte(m, '/')+1:])
@@ -1016,6 +1031,8 @@ func ResumeCommand(agent, id, cwd string) string {
 		run = "qoderclicn --resume " + id
 	case "grok":
 		run = "grok --resume " + id
+	case "omp":
+		run = "omp --resume " + id
 	default:
 		return ""
 	}

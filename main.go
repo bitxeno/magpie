@@ -50,6 +50,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie backup [--no-keys] [--no-library] [file]    providers, keys, settings, profiles, agent models and the library in one file, sealed with a passphrase
   magpie restore [--no-agents] [--no-library] <file> put a backup in on this machine
   magpie webdav [on <address>|set k=v…|now|off]      the same, kept the same on every computer through a WebDAV folder (magpie webdav help)
+  magpie s3 [on s3://<bucket>[/<prefix>]|set k=v…|now|off]   the same through an S3-compatible bucket: AWS, R2, B2, MinIO… (magpie s3 help)
 
   magpie library [sync|instructions|mcp|skill]   the instructions, MCP servers and skills written into every agent (magpie library help)
 
@@ -76,9 +77,12 @@ const usage = `magpie — one place to pick every agent's model
   magpie accounts project <gemini|antigravity> <email> <project>   the Google Cloud project a Google account's requests go to
   magpie plugin [add <package>|rm|update|on|off|login <provider>|logout <provider>]
                                   OpenCode provider plugins: subscriptions signed in to, and served, through a plugin
+  magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
+  magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
 
   magpie serve                    run the gateway alone (the app runs it too)
-  magpie mcp image                the image generation MCP server an agent is given from the library (stdio)
+  magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
+  magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
   magpie usage [today|7d|30d|all] tokens and cost per agent and model (30d)
   magpie usage --csv [today|7d|30d|all]   every request as CSV: the model asked for, sent and served, tokens, cost, time, status
   magpie sessions [--model <m>] [--folder <f>] [--json]   the latest Claude Code, Codex, OpenCode and Pi sessions, with what each cost
@@ -112,6 +116,10 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "healthcheck" {
+		return healthcheck() // every few seconds in a container: nothing else
+	}
+	makeDirs()
 	settings.Migrate()
 	agent.RenameLegacy()
 	agent.MoveCursorEfforts()
@@ -153,6 +161,11 @@ func run(args []string) error {
 		return runGUI(true, "")
 	case "tray":
 		return runGUI(false, "")
+	case "-Embedding":
+		// Windows starting magpie for a click on one of its notifications
+		// (a usage alert, #368) left in the Action Center after it quit:
+		// the window, on the Usage page
+		return runWindow("usage")
 	case "panel":
 		return runPanel()
 	case "autostart":
@@ -220,6 +233,8 @@ func run(args []string) error {
 		return webdavCmd(args[1:])
 	case "plugin", "plugins":
 		return pluginCmd(args)
+	case "s3":
+		return s3Cmd(args[1:])
 	case "mcp":
 		return imagemcp.Run(args[1:])
 	case "claude-mcp-helper": // internal: stdio MCP subprocess spawned by Claude Code
@@ -284,7 +299,7 @@ func set(a *agent.Agent, key, value string) error {
 	// value it had already is said to be so
 	now := f.Get()
 	shown := now
-	if value == "" {
+	if value == "" || now == "" {
 		shown = muted.Render("default")
 	}
 	if now == before {
@@ -301,6 +316,16 @@ func set(a *agent.Agent, key, value string) error {
 
 func fieldForValue(a *agent.Agent, v string) *agent.Field {
 	vals := a.Values()
+	// the agent's suffix after a model (omp's ":max") aside: a role on the
+	// same model at that level offers it as typed, and would take it. A list
+	// of models no picker offers: it is for the model
+	if a.SplitSuffix != nil {
+		m, _, one := a.SplitSuffix(v)
+		if !one {
+			return nil
+		}
+		v = m
+	}
 	// a model stays with the model, even where other fields offer it too
 	// (Claude Code's opus/sonnet/haiku/fable)
 	for _, o := range a.Fields[0].Options(vals) {

@@ -3,8 +3,9 @@
 // "From plugins"; its sign-in asks the way to sign in, the method's
 // questions (a pick, then a text the plugin checks), then opens the
 // browser and takes the code its page shows; an "api" way takes a key and
-// opens the account. Settings → Plugins lists the plugins, why one didn't
-// load, and adds one. English and Chinese; the API is faked here.
+// opens the account; another account is added beside it, as a built-in
+// subscription's is, and can be put first. (The Plugins tab is
+// plugin-market.test.cjs.) English and Chinese; the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -14,10 +15,16 @@ const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 
 const plugin = { id: "fakeco", pid: "fakeco", name: "FakeCo", icon: "generic", spec: "opencode-fakeco-auth", signedIn: false, models: 3,
-  methods: [{ type: "api", label: "API key" }, { type: "oauth", label: "Browser sign-in" }] };
+  methods: [{ type: "api", label: "API key" }, { type: "oauth", label: "Browser sign-in" },
+    { type: "api", label: "Paste an existing FakeCo session token from another device you are signed in on" }] };
 
 function server(lang, asked) {
-  let signedIn = false;
+  const accts = []; // who is signed in, the first in use first
+  const payload = () => {
+    const providers = [{ id: "openai", name: "OpenAI", icon: "openai", preset: "openai", models: [], agents: [], key: { set: true, masked: "sk-…ab12" } }];
+    if (accts.length) providers.push({ id: "fakeco", name: "FakeCo", icon: "generic", models: [], agents: [], key: {}, account: { agent: "fakeco", agentName: "FakeCo", agentIcon: "generic", user: accts[0], logins: accts.map((user, i) => ({ user, active: i === 0, on: true })) } });
+    return { providers, presets: [], excluded: [], gateway: { running: true, window: true }, plugins: [{ ...plugin, signedIn: accts.length > 0 }] };
+  };
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (data) => route.fulfill({ json: data });
@@ -25,10 +32,12 @@ function server(lang, asked) {
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:false};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
-    if (url.pathname === "/api/providers") {
-      const providers = [{ id: "openai", name: "OpenAI", icon: "openai", preset: "openai", models: [], agents: [], key: { set: true, masked: "sk-…ab12" } }];
-      if (signedIn) providers.push({ id: "fakeco", name: "FakeCo", icon: "", models: [], agents: [], key: {}, account: { agent: "fakeco", agentName: "FakeCo", agentIcon: "generic", user: "API key" } });
-      return json({ providers, presets: [], excluded: [], gateway: { running: true, window: true }, plugins: [{ ...plugin, signedIn }] });
+    if (url.pathname === "/api/providers") return json(payload());
+    if (url.pathname === "/api/login/switch") {
+      const b = body();
+      asked.push(["switch", b]);
+      accts.unshift(...accts.splice(accts.indexOf(b.user), 1));
+      return json(payload());
     }
     if (url.pathname === "/api/groups") return json({ groups: [], pools: [] });
     if (url.pathname === "/api/gateway/trace") return json({ routes: [] });
@@ -45,16 +54,11 @@ function server(lang, asked) {
     if (url.pathname === "/api/plugin-signin") {
       const b = body();
       asked.push(["signin", b]);
-      if (b.key) { signedIn = true; return json({ agent: "fakeco", state: "done", user: "FakeCo" }); }
+      if (b.key) { accts.push("API key …" + b.key); return json({ agent: "fakeco", state: "done", user: accts.at(-1) }); }
       return json({ id: "p1", agent: "fakeco", state: "waiting", url: "https://fake.test/auth", pasteCode: true, instructions: "Paste the code FakeCo shows." });
     }
     if (url.pathname === "/api/signin/p1/callback") { asked.push(["code", body()]); return route.fulfill({ status: 204 }); }
     if (url.pathname === "/api/signin/p1") return json({ id: "p1", agent: "fakeco", state: "waiting", url: "https://fake.test/auth", pasteCode: true, instructions: "Paste the code FakeCo shows." });
-    if (url.pathname === "/api/plugins") return json({ bun: true, bunVersion: "1.3.0", plugins: [
-      { spec: "opencode-fakeco-auth", providers: ["FakeCo"] },
-      { spec: "opencode-broken", error: "Cannot find module 'x'", providers: [] },
-    ] });
-    if (url.pathname === "/api/plugins/add") { asked.push(["add", body()]); return json({ bun: true, plugins: [{ spec: "opencode-fakeco-auth", providers: ["FakeCo"] }, { spec: body().spec, providers: ["Other"] }] }); }
     if (url.pathname.startsWith("/api/")) return json({});
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
     const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
@@ -63,10 +67,8 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { section: "From plugins", how: "How do you sign in to FakeCo?", next: "Next", code: "Code", finish: "Finish sign-in", key: "FakeCo API key", signIn: "Sign in",
-    plugins: "Plugins", failed: /Didn't load: Cannot find module/, signs: "Signs in to FakeCo", add: "Add" },
-  zh: { section: "来自插件", how: "用哪种方式登录 FakeCo？", next: "下一步", code: "验证码", finish: "完成登录", key: "FakeCo API Key", signIn: "登录",
-    plugins: "插件", failed: /没有加载成功：Cannot find module/, signs: "可登录 FakeCo", add: "添加" },
+  en: { section: "From plugins", how: "How do you sign in to FakeCo?", next: "Next", code: "Code", finish: "Finish sign-in", key: "FakeCo API key", signIn: "Sign in", add: "Add another FakeCo account", first: "Make first", note: "The gateway uses the first. Tick more" },
+  zh: { section: "来自插件", how: "用哪种方式登录 FakeCo？", next: "下一步", code: "验证码", finish: "完成登录", key: "FakeCo API Key", signIn: "登录", add: "添加另一个 FakeCo 账号", first: "设为首选", note: "网关优先用第一个账号。多勾选几个" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -94,6 +96,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await box.locator(".n", { hasText: w.how }).waitFor();
         if (process.env.ARTIFACT_DIR) await sheet.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-method-${engine}-${lang}.png`) });
         assert.equal(asked.length, 0, "nothing asked before the way is picked");
+        // however long the plugin names its ways, the question keeps its
+        // line and every way stays inside the box
+        const fit = await box.evaluate((b) => {
+          const r = b.getBoundingClientRect(), n = b.querySelector(".tt").getBoundingClientRect();
+          return { question: n.width / r.width, spill: [...b.querySelectorAll(".choices button")].map((x) => x.getBoundingClientRect().right - r.right) };
+        });
+        assert.ok(fit.question > 0.5, "the question squeezed to " + fit.question);
+        assert.equal(fit.spill.length, 3);
+        for (const s of fit.spill) assert.ok(s <= 0, "a way runs past the box by " + s);
         await box.locator("button", { hasText: "Browser sign-in" }).click();
         await box.locator(".n", { hasText: "Where do you work?" }).waitFor();
         await box.locator("button", { hasText: "Work" }).click();
@@ -126,19 +137,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForFunction(() => editing === "fakeco");
         assert.deepEqual(asked.filter(([k]) => k === "signin").pop()[1], { provider: "fakeco", method: 0, inputs: {}, key: "k1" });
 
-        // Settings → Plugins
-        await page.goto("http://magpie.test/?view=settings");
-        const list = page.locator("#pluginsList");
-        await list.locator(".sub", { hasText: w.signs }).waitFor();
-        await list.locator(".sub.bad", { hasText: w.failed }).waitFor();
-        await list.getByRole("textbox").fill("opencode-other-auth");
-        await list.locator("button", { hasText: new RegExp("^" + w.add + "$") }).click();
-        await list.locator(".name", { hasText: "opencode-other-auth" }).waitFor();
-        assert.deepEqual(asked.find(([k]) => k === "add")[1], { spec: "opencode-other-auth" });
-        if (process.env.ARTIFACT_DIR) {
-          await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
-          await list.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugins-${engine}-${lang}.png`) });
-        }
+        // another account, beside the first: the editor adds it, lists
+        // both, and puts the second first when asked
+        const ed = page.locator("#modal .editor");
+        const add = ed.locator(".accts .acc.add", { hasText: w.add });
+        await add.waitFor();
+        assert.match(await ed.innerText(), new RegExp(w.note));
+        await add.click();
+        await ed.locator(".signing button", { hasText: "API key" }).first().click();
+        await ed.getByLabel(w.key).fill("k2");
+        await ed.locator(".signing button", { hasText: w.signIn }).click();
+        const rows = ed.locator(".accts .acc:not(.add)");
+        await page.waitForFunction(() => document.querySelectorAll("#modal .editor .accts .acc:not(.add)").length === 2);
+        assert.deepEqual(await rows.locator(".n").allInnerTexts(), ["API key …k1", "API key …k2"]);
+        if (process.env.ARTIFACT_DIR) await ed.locator(".accts").screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-accounts-${engine}-${lang}.png`) });
+        await rows.nth(1).locator("button", { hasText: w.first }).click();
+        await page.waitForFunction(() => document.querySelector("#modal .editor .accts .acc .n")?.textContent === "API key …k2");
+        assert.deepEqual(asked.filter(([k]) => k === "switch").pop()[1], { agent: "fakeco", user: "API key …k2" });
+
         assert.deepEqual(errors, []);
       });
     }

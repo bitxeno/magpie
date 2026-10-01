@@ -10,6 +10,7 @@
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="routing.css">
 <link rel="stylesheet" href="library.css">
+<link rel="stylesheet" href="plugins.css">
 <link rel="stylesheet" href="omarchy.css">
 </head>
 <body>
@@ -25,12 +26,18 @@
     <button data-view="routing" data-t>Routing</button>
     <button data-view="usage" data-t>Usage</button>
     <button data-view="library" data-t>Library</button>
+    <button data-view="plugins" data-t>Plugins</button>
   </nav>
   <div class="actions" style="--wails-draggable:no-drag">
-    <button class="update" id="update" hidden>
-      <svg viewBox="0 0 16 16" width="11" height="11"><path d="M8 13V3.5M3.75 7.5 8 3.25l4.25 4.25" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span>Update</span>
-    </button>
+    <span class="update-wrap">
+      <button class="update" id="update" hidden>
+        <svg viewBox="0 0 16 16" width="11" height="11"><path d="M8 13V3.5M3.75 7.5 8 3.25l4.25 4.25" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Update</span>
+      </button>
+      <button class="update-hide" id="updateHide" title="Hide until the next version" data-tt>
+        <svg viewBox="0 0 10 10" width="8" height="8"><path d="M2.5 2.5l5 5M7.5 2.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </span>
     <button class="icon" id="sync" title="Refresh model lists (models.dev and every vendor) and check for a newer magpie" data-tt>
       <svg viewBox="0 0 16 16" width="14" height="14"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2v3h-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
@@ -64,10 +71,12 @@
 </main>
 
 <main class="view" id="view-providers" hidden>
+  <div id="movable" hidden></div>
   <div class="list" id="providers"></div>
   <div id="excluded"></div>
   <div class="after-list">
     <button class="text" id="addProvider" data-t>＋ Add provider</button>
+    <button class="more-subs" id="moreSubs" type="button" title="Cursor, Copilot, Gemini and others, each signed in to by a plugin you install from the Plugins tab" data-tt><span class="stack"></span><span class="say"><span data-t>More subscriptions</span><span class="in" data-t>in Plugins</span></span></button>
   </div>
   <section class="sheet" id="addSheet" hidden></section>
 </main>
@@ -103,6 +112,7 @@
     <div class="row-head quota-head" id="quotaHead" hidden>
       <span class="label" data-t>Allowances</span>
       <span class="grow"></span>
+      <button class="text" id="quotaRefresh" data-tt="Read the allowances again; a Claude account's is read by running Claude Code's own /usage"><span data-t>Refresh</span></button>
       <button class="text rt-mask" id="usageMask" aria-pressed="false" data-tt="Mask the email addresses on this page, for a screenshot to share"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 8 10 8a17.6 17.6 0 0 1-2.2 3.2M6.6 6.6C3.9 8.4 2 12 2 12s3.5 8 10 8a9.7 9.7 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2M2 2l20 20"/></svg><span data-t>Hide emails</span></button>
       <div class="segs" id="quotaMode" hidden></div>
     </div>
@@ -157,6 +167,8 @@
 
 <main class="view" id="view-library" hidden></main>
 
+<main class="view" id="view-plugins" hidden></main>
+
 <main class="view" id="view-settings" hidden>
   <div class="row-head"><span class="label" data-t>Preferences</span></div>
   <div class="list prefs">
@@ -188,6 +200,10 @@
       <div class="who"><div class="name" data-t>Menu bar refresh</div><div class="sub" data-t>How often the usage beside the icon is asked for again</div></div>
       <div id="trayEverySegs"></div>
     </div>
+    <div class="row pref" id="trayLogosRow" hidden>
+      <div class="who"><div class="name" data-t>Menu bar logos</div><div class="sub" data-t>Each subscription's logo before its numbers; off, the numbers alone with a thin line between subscriptions</div></div>
+      <div id="trayLogosSegs"></div>
+    </div>
     <div class="row pref">
       <div class="who"><div class="name" data-t>Usage shows</div><div class="sub" data-t>How much of each window is used, or how much is left, on the Usage page, the panel and the menu bar</div></div>
       <div id="quotaLeftSegs"></div>
@@ -195,6 +211,18 @@
     <div class="row pref">
       <div class="who"><div class="name" data-t>Currency</div><div class="sub" id="currencySub"></div></div>
       <div id="currencySegs"></div>
+    </div>
+    <div class="row pref" id="usageAlertRow">
+      <div class="who"><div class="name" data-t>Usage alert</div><div class="sub" id="usageAlertSub"></div></div>
+      <div id="usageAlertSegs" class="warm-at"></div>
+    </div>
+    <div class="row pref" id="balanceAlertRow">
+      <div class="who"><div class="name" data-t>Low balance alert</div><div class="sub" id="balanceAlertSub"></div></div>
+      <div id="balanceAlertSegs" class="warm-at"></div>
+    </div>
+    <div class="row pref">
+      <div class="who"><div class="name" data-t>Provider in model names</div><div class="sub" data-t>Agents’ model lists name each model with its provider or “routing group” after it. Off, the name alone, unless two would read the same</div></div>
+      <div id="plainNamesSegs"></div>
     </div>
     <div class="row pref">
       <div class="who"><div class="name" data-t>Open at login</div><div class="sub" data-t>Start magpie in the tray when you log in, so agents find the gateway from the start</div></div>
@@ -252,8 +280,6 @@
   <div class="list prefs" id="imagesList"></div>
   <div class="row-head"><span class="label" data-t>Privacy</span></div>
   <div class="list prefs" id="redactList"></div>
-  <div class="row-head"><span class="label" data-t>Plugins</span></div>
-  <div class="list prefs" id="pluginsList"></div>
   <div class="row-head"><span class="label" data-t>Sync and backup</span></div>
   <div class="list prefs" id="syncList"></div>
   <div class="row-head"><span class="label" data-t>About</span></div>
@@ -295,5 +321,6 @@
 <script src="app.js"></script>
 <script src="routing.js"></script>
 <script src="library.js"></script>
+<script src="plugins.js"></script>
 </body>
 </html>

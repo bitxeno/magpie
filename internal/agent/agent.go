@@ -71,6 +71,11 @@ type Agent struct {
 	// rather than asking the gateway, rewrites that list as the catalog is
 	// now — where magpie wrote one; nothing else changes (see SyncCatalog).
 	Sync func() error
+	// RenameRefs, for an agent whose config names magpie's models beyond
+	// its fields (omp's other roles and fallback chains), moves those names
+	// off provider from onto to, the rest of each kept; it answers whether
+	// any moved. The fields themselves are RenameProvider's.
+	RenameRefs func(from, to string) (bool, error)
 	// Check, for an agent magpie wires in beyond its model field, says what
 	// of that wiring is gone while the model is still one of magpie's —
 	// something else rewrote the config — or "" when it is all there
@@ -87,6 +92,11 @@ type Agent struct {
 	// WSL is the distro an agent inside WSL lives in, "" for this
 	// machine's own (see wsl.go).
 	WSL string
+	// Home is a WSL agent's $HOME in its distro as magpie opens it
+	// (\\wsl.localhost\<distro>\home\me), where its other files are; ""
+	// for this machine's, and while the distro is stopped: opening it
+	// would start it.
+	Home string
 	// Import, for an app that takes magpie only through an import link of
 	// its own, which the user confirms there (Cindy), is that link; the app
 	// has no fields magpie sets. Added says whether it has magpie already.
@@ -96,6 +106,18 @@ type Agent struct {
 	// environment (agy), is the command that starts it on magpie, while
 	// it is on one of magpie's models; "" otherwise.
 	Launch func() string
+	// SplitSuffix, for an agent whose model values carry something of its
+	// own after the model that varies from value to value (omp's thinking
+	// level, "…:max"), splits a value into the model the picker offers and
+	// that suffix, "" when there is none. What matches a value against the
+	// picker (drift, Reseat, RenameProvider, Spell) matches the model and
+	// puts the suffix back after the one it moves to. A mark that is always
+	// the same for a model (Claude Code's [1m]) rides on the option instead.
+	// one is false for a value that is no one model but a list the agent
+	// falls back through (omp's "a,b"): that is the user's own whatever it
+	// names, never taken for one of magpie's models nor moved by what
+	// matches the picker (RenameRefs moves the names in it).
+	SplitSuffix func(v string) (model, suffix string, one bool)
 	// detect, when set, says whether the agent is here in place of looking
 	// for its files and binary: a distro's, probed once.
 	detect func() bool
@@ -265,19 +287,25 @@ func ids(as []*Agent) []string {
 // in others, and either is taken in both. A value the picker offers as is
 // stays, and so does one it doesn't know (a model the agent reaches on its
 // own that isn't listed); a "magpie/…" value the catalog doesn't have is an
-// error rather than a model the agent would ask its own vendor for.
+// error rather than a model the agent would ask its own vendor for. The
+// agent's suffix after the model (SplitSuffix) stays as typed, and so does
+// a list of models, the user's own.
 func (a *Agent) Spell(key, v string) (string, error) {
 	f := a.Field(key)
 	if f == nil || f.Options == nil || v == "" {
 		return v, nil
 	}
+	model, suffix, one := a.split(v)
+	if !one {
+		return v, nil
+	}
 	opts := f.Options(a.Values())
 	for _, o := range opts {
-		if o.Value == v {
+		if o.Value == model {
 			return v, nil
 		}
 	}
-	ref, prefixed := strings.CutPrefix(v, magpieID+"/")
+	ref, prefixed := strings.CutPrefix(model, magpieID+"/")
 	// a provider renamed since (a profile saved before) is the same one
 	refs := []string{ref}
 	if r := provider.RenamedRef(ref); r != ref {
@@ -286,7 +314,7 @@ func (a *Agent) Spell(key, v string) (string, error) {
 	for _, r := range refs {
 		for _, o := range opts {
 			if o.Ref != "" && o.Ref == r {
-				return o.Value, nil
+				return o.Value + suffix, nil
 			}
 		}
 	}
@@ -294,6 +322,16 @@ func (a *Agent) Spell(key, v string) (string, error) {
 		return "", fmt.Errorf("%s isn't a model in magpie's catalog (magpie models lists them)", ref)
 	}
 	return v, nil
+}
+
+// split is v as the model the picker offers and the agent's suffix after
+// it (SplitSuffix), one false for a list of models; the whole of v for an
+// agent without one.
+func (a *Agent) split(v string) (model, suffix string, one bool) {
+	if a.SplitSuffix == nil {
+		return v, "", true
+	}
+	return a.SplitSuffix(v)
 }
 
 // atomic makes each of an agent's field sets, and its Sync, one edit of the

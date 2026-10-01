@@ -21,7 +21,9 @@ const pluginUsage = `usage: magpie plugin [list] [--json]
        magpie plugin update                        install the newest version of each
        magpie plugin on|off <name>                 turn one on or off
        magpie plugin login <provider> [<method>]   sign in to a provider a plugin adds
-       magpie plugin logout <provider>             forget the sign-in`
+       magpie plugin logout <provider>             forget the sign-in
+       magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
+       magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts`
 
 // pluginCmd: `magpie plugin …` — OpenCode's provider plugins, which sign in
 // to a subscription and carry its requests (internal/plugin).
@@ -53,8 +55,12 @@ func pluginCmd(args []string) error {
 		if len(rest) != 1 {
 			return errors.New(pluginUsage)
 		}
-		if err := plugin.Remove(ctx, rest[0]); err != nil {
+		back := provider.MovedOnto(rest[0])
+		if err := provider.RemovePlugin(ctx, rest[0]); err != nil {
 			return err
+		}
+		for _, id := range back {
+			fmt.Println(green.Render("✓"), id, "is back on its built-in")
 		}
 		fmt.Println(green.Render("✓"), "removed", rest[0])
 		return nil
@@ -68,8 +74,15 @@ func pluginCmd(args []string) error {
 		if len(rest) != 1 {
 			return errors.New(pluginUsage)
 		}
-		if err := plugin.SetOff(rest[0], sub == "off"); err != nil {
+		var back []string
+		if sub == "off" {
+			back = provider.MovedOnto(rest[0])
+		}
+		if err := provider.SetPluginOff(ctx, rest[0], sub == "off"); err != nil {
 			return err
+		}
+		for _, id := range back {
+			fmt.Println(green.Render("✓"), id, "is back on its built-in")
 		}
 		fmt.Println(green.Render("✓"), rest[0], "is", sub)
 		return nil
@@ -90,10 +103,37 @@ func pluginCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := plugin.SignOut(ctx, pp.ID); err != nil {
+		if err := plugin.SignOut(ctx, pp.ID, ""); err != nil {
 			return err
 		}
 		fmt.Println(green.Render("✓"), "signed out of", pp.Name)
+		return nil
+	case "move", "migrate":
+		if len(rest) != 1 {
+			return errors.New(pluginUsage)
+		}
+		if !provider.Movable(rest[0]) {
+			return fmt.Errorf("%s has no plugin to move to", rest[0])
+		}
+		if !plugin.HasBun() {
+			fmt.Println(muted.Render("Downloading Bun " + plugin.BunVersion + ", which plugins run on…"))
+		}
+		if err := provider.Move(ctx, rest[0]); err != nil {
+			return fmt.Errorf("%s stays built-in: %w", rest[0], err)
+		}
+		fmt.Println(green.Render("✓"), rest[0], "runs on", provider.MovePackage(rest[0]), muted.Render("(magpie plugin move-back "+rest[0]+" to undo)"))
+		return nil
+	case "move-back", "moveback", "unmigrate":
+		if len(rest) != 1 {
+			return errors.New(pluginUsage)
+		}
+		if !provider.Moved(rest[0]) {
+			return fmt.Errorf("%s isn't on its plugin", rest[0])
+		}
+		if err := provider.MoveBack(ctx, rest[0]); err != nil {
+			return err
+		}
+		fmt.Println(green.Render("✓"), rest[0], "is built-in again")
 		return nil
 	case "help", "-h", "--help":
 		fmt.Println(pluginUsage)
@@ -123,6 +163,12 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 		fmt.Println(string(b))
 		return nil
 	}
+	// a built-in with accounts the plugin could run: not signed in to the
+	// plugin is its normal state, not something to fix
+	onBuiltin := map[string]provider.MoveCandidate{}
+	for _, c := range provider.MoveCandidates() {
+		onBuiltin[c.ID] = c
+	}
 	for _, e := range l.Plugins {
 		state := green.Render("on")
 		switch {
@@ -137,6 +183,9 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 				continue
 			}
 			who := muted.Render("not signed in · magpie plugin login " + p.ID)
+			if c, ok := onBuiltin[p.ID]; ok && !p.SignedIn {
+				who = muted.Render(fmt.Sprintf("runs on magpie's built-in (%d accounts) · magpie plugin move %s", c.Accounts, p.ID))
+			}
 			if p.SignedIn {
 				who = green.Render("signed in")
 				if p.AccountID != "" {
@@ -234,17 +283,17 @@ func pluginLogin(ctx context.Context, name, method string) error {
 			fmt.Println(msg)
 		}
 	}
-	var saved string
+	var saved plugin.Saved
 	if pp.Methods[m].Type == "api" {
-		key, err := secret("key", pp.Name+" API key: ", false)
+		key, err := secret("key", keyPrompt(pp.Name, pp.Methods[m]), false)
 		if err != nil {
 			return err
 		}
-		if saved, err = plugin.APIKey(ctx, pp.ID, m, inputs, key); err != nil {
+		if saved, err = plugin.APIKey(ctx, pp.ID, m, inputs, key, plugin.NewAccount); err != nil {
 			return err
 		}
 	} else {
-		a, err := plugin.Authorize(ctx, pp.ID, m, inputs)
+		a, err := plugin.Authorize(ctx, pp.ID, m, inputs, plugin.NewAccount)
 		if err != nil {
 			return err
 		}
@@ -271,8 +320,18 @@ func pluginLogin(ctx context.Context, name, method string) error {
 			return err
 		}
 	}
-	fmt.Println(green.Render("✓"), "signed in to", pp.Name, muted.Render("· its models are "+provider.PluginID(saved)+"/<model>"))
+	fmt.Println(green.Render("✓"), "signed in to", pp.Name, muted.Render("· its models are "+provider.PluginID(saved.Provider)+"/<model>"))
 	return nil
+}
+
+// keyPrompt asks an "api" method's key: its title, then the hint the
+// plugin gives (its placeholder), as a question's is.
+func keyPrompt(name string, m plugin.Method) string {
+	p := m.KeyTitle(name)
+	if m.Placeholder != "" {
+		p += " " + muted.Render("("+m.Placeholder+")")
+	}
+	return p + ": "
 }
 
 func askNumber(n int) (int, error) {

@@ -9,6 +9,13 @@ package provider
 // selected_model the requests then name, the available_models and when it
 // expires_at (unix seconds). Every request of the session carries the token
 // in Copilot-Session-Token, with the selected model in its body.
+//
+// VS Code's Copilot Chat asks the same (automodeService.ts, through
+// @vscode/copilot-api's RequestType.AutoModels: {endpoints.api}/models/session)
+// with an API version, X-GitHub-Api-Version 2025-10-01, which the editors'
+// requests otherwise leave out: without it Copilot answers 404 (#256). Its
+// answer has no selected_model: the client takes the first of
+// available_models it knows.
 
 import (
 	"bytes"
@@ -17,6 +24,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +34,10 @@ import (
 
 // CopilotAuto is the model id that has Copilot pick the model.
 const CopilotAuto = "auto"
+
+// copilotAutoVersion is the API version VS Code's Copilot Chat asks for an
+// Auto session with; the Copilot CLI's headers name their own.
+const copilotAutoVersion = "2025-10-01"
 
 // copilotAutoModel is Auto as magpie lists it.
 var copilotAutoModel = catalog.Model{ID: CopilotAuto, Name: "Auto"}
@@ -44,11 +56,12 @@ var (
 type copilotAutoKey struct{}
 
 // copilotAutoResolve is the account's Auto session, asked again a couple of
-// minutes before it expires or when fresh is set.
+// minutes before it expires, when fresh is set or once the account was
+// refused its model.
 func copilotAutoResolve(ctx context.Context, app copilotApp, fresh bool) (copilotAutoSession, error) {
 	copilotAutoMu.Lock()
 	defer copilotAutoMu.Unlock()
-	if a, ok := copilotAutoSessions[app.Token]; ok && !fresh && (a.ExpiresAt == 0 || time.Until(time.Unix(a.ExpiresAt, 0)) > 2*time.Minute) {
+	if a, ok := copilotAutoSessions[app.Token]; ok && !fresh && (a.ExpiresAt == 0 || time.Until(time.Unix(a.ExpiresAt, 0)) > 2*time.Minute) && !copilotRefuses(app.Token, a.Model) {
 		return a, nil
 	}
 	s, err := app.session(ctx)
@@ -65,6 +78,7 @@ func copilotAutoResolve(ctx context.Context, app copilotApp, fresh bool) (copilo
 	}
 	req.Header.Set("Authorization", "Bearer "+s.Token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", copilotAutoVersion)
 	for k, v := range s.headers() {
 		req.Header.Set(k, v)
 	}
@@ -77,7 +91,11 @@ func copilotAutoResolve(ctx context.Context, app copilotApp, fresh bool) (copilo
 	var v struct {
 		Token     string          `json:"session_token"`
 		Selected  json.RawMessage `json:"selected_model"`
+		Available []string        `json:"available_models"`
 		ExpiresAt int64           `json:"expires_at"`
+	}
+	if res.StatusCode == http.StatusNotFound {
+		return copilotAutoFallback(ctx, app, APIError(b, res.Status))
 	}
 	if res.StatusCode/100 != 2 || json.Unmarshal(b, &v) != nil || v.Token == "" {
 		return copilotAutoSession{}, errors.New("Copilot Auto: " + APIError(b, res.Status))
@@ -91,10 +109,58 @@ func copilotAutoResolve(ctx context.Context, app copilotApp, fresh bool) (copilo
 		json.Unmarshal(v.Selected, &m)
 		model = m.ID
 	}
+	// one the account was refused is passed over for another available
+	if model != "" && copilotRefuses(app.Token, model) {
+		model = ""
+	}
+	available := slices.DeleteFunc(slices.Clone(v.Available), func(id string) bool { return copilotRefuses(app.Token, id) })
+	// none named: the first available the account's list served, as VS
+	// Code picks among the models it knows
+	if model == "" {
+		copilotSeenMu.Lock()
+		for _, id := range available {
+			if _, ok := copilotSeen[id]; ok {
+				model = id
+				break
+			}
+		}
+		copilotSeenMu.Unlock()
+	}
+	if model == "" && len(available) > 0 {
+		model = available[0]
+	}
+	if model == "" && len(v.Available) > 0 {
+		// every model Auto offers the account was refused it: the one it
+		// may pick by hand, as when it has no Auto
+		return copilotAutoFallback(ctx, app, "every model Copilot Auto offers was refused")
+	}
 	if model == "" {
 		return copilotAutoSession{}, errors.New("Copilot Auto picked no model")
 	}
 	a := copilotAutoSession{Token: v.Token, Model: model, ExpiresAt: v.ExpiresAt}
+	copilotAutoSessions[app.Token] = a
+	return a, nil
+}
+
+// copilotAutoFallback stands in for an Auto session Copilot has none of for
+// the account (404): the model it may pick by hand likeliest served (see
+// copilotModels) and not refused it, sent without a session, for a while;
+// with none, an error that says so.
+func copilotAutoFallback(ctx context.Context, app copilotApp, why string) (copilotAutoSession, error) {
+	copilotTermsMu.Lock()
+	picks, known := copilotPicks[app.Token]
+	copilotTermsMu.Unlock()
+	if !known {
+		copilotModels(ctx, app)
+		copilotTermsMu.Lock()
+		picks = copilotPicks[app.Token]
+		copilotTermsMu.Unlock()
+	}
+	picks = slices.DeleteFunc(slices.Clone(picks), func(id string) bool { return copilotRefuses(app.Token, id) })
+	if len(picks) == 0 {
+		return copilotAutoSession{}, errors.New("Copilot doesn't offer Auto to this account (" + why + "), and lists no model it may pick by hand that it serves; check the plan at github.com/settings/copilot")
+	}
+	a := copilotAutoSession{Model: picks[0], ExpiresAt: time.Now().Add(10 * time.Minute).Unix()}
 	copilotAutoSessions[app.Token] = a
 	return a, nil
 }
@@ -119,14 +185,20 @@ func (p Provider) ResolveAuto(ctx context.Context, model string) (context.Contex
 // swapped for the one picked.
 func copilotAutoSign(ctx context.Context, app copilotApp, req *http.Request, body []byte) (model string, err error) {
 	model = bodyModel(body)
-	if a, ok := ctx.Value(copilotAutoKey{}).(copilotAutoSession); ok && a.Model == model {
-		req.Header.Set("Copilot-Session-Token", a.Token)
+	a, auto := ctx.Value(copilotAutoKey{}).(copilotAutoSession)
+	auto = auto && a.Model == model
+	if auto && !copilotRefuses(app.Token, model) {
+		if a.Token != "" {
+			req.Header.Set("Copilot-Session-Token", a.Token)
+		}
 		return model, nil
 	}
-	if model != CopilotAuto {
+	// Auto's pick sent again once the account was refused it
+	// (copilotRefused) goes as Auto's next pick
+	if model != CopilotAuto && !auto {
 		return model, nil
 	}
-	a, err := copilotAutoResolve(ctx, app, false)
+	a, err = copilotAutoResolve(ctx, app, false)
 	if err != nil {
 		return model, err
 	}
@@ -139,7 +211,9 @@ func copilotAutoSign(ctx context.Context, app copilotApp, req *http.Request, bod
 	req.Body = io.NopCloser(bytes.NewReader(nb))
 	req.ContentLength = int64(len(nb))
 	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(nb)), nil }
-	req.Header.Set("Copilot-Session-Token", a.Token)
+	if a.Token != "" {
+		req.Header.Set("Copilot-Session-Token", a.Token)
+	}
 	return a.Model, nil
 }
 

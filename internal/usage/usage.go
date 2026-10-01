@@ -23,11 +23,13 @@ import (
 
 // Record is one call.
 type Record struct {
-	Time     time.Time `json:"t"`
-	Agent    string    `json:"agent"` // magpie agent id, or the client's product name
-	Provider string    `json:"provider"`
-	Host     string    `json:"host,omitempty"` // where the call went: provider.Where then
-	Model    string    `json:"model"`          // the provider's model id
+	Time            time.Time `json:"t"`
+	Agent           string    `json:"agent"` // magpie agent id, or the client's product name
+	Provider        string    `json:"provider"`
+	Host            string    `json:"host,omitempty"`          // where the call went: provider.Where then
+	ProviderKeyID   string    `json:"providerKeyId,omitempty"` // fingerprint of the API key actually used
+	ProviderKeyName string    `json:"providerKeyName,omitempty"`
+	Model           string    `json:"model"` // the provider's model id
 	// Requested is the model id the agent asked for (a magpie alias, a
 	// routing group, provider/model…), and Served the model the vendor's
 	// reply says answered, when it named one: a ledger to set beside the
@@ -57,6 +59,10 @@ type Record struct {
 	// Kind is what the agent made the call for when it isn't a turn of
 	// the conversation: a Codex subagent's (review, compact, guardian…)
 	Kind string `json:"kind,omitempty"`
+	// Via is the computer whose magpie passed the call on to this one (a
+	// Remote magpie provider there), Agent being the agent's on it; "" for
+	// a call made on this computer
+	Via string `json:"via,omitempty"`
 }
 
 // Path is the log file: ~/.config/magpie/usage.jsonl (XDG-aware).
@@ -176,7 +182,7 @@ type Totals struct {
 	CacheRead  int     `json:"cache_read"`
 	CacheWrite int     `json:"cache_write"`
 	Reasoning  int     `json:"reasoning"`
-	Cost       float64 `json:"cost"`     // USD at list prices, for the priced calls
+	Cost       float64 `json:"cost"`     // USD at the effective price, for the priced calls
 	Unpriced   int     `json:"unpriced"` // calls with tokens but no known price
 	// Timed: the answered calls whose first token was timed (streamed),
 	// TTFT the sum of their ttft_ms; DecodeMs the time from it to the end
@@ -208,7 +214,7 @@ func (t Totals) Speed() float64 {
 	return float64(t.DecodeOut) / (float64(t.DecodeMs) / 1000)
 }
 
-// FormatCost renders a list-price cost, kept in USD everywhere it's
+// FormatCost renders an effective-price cost, kept in USD everywhere it's
 // stored, as the CLI and TUI show it: at amountUSD's own price when
 // currency isn't "cny", else converted at rate (CNY per one USD, from
 // internal/fx; a rate of 0 or below also falls back to USD, a stale or
@@ -260,9 +266,11 @@ func (t *Totals) add(r Record, price *catalog.Price) {
 
 // Group is the share of one agent or model.
 type Group struct {
-	ID       string `json:"id"`
-	Provider string `json:"provider,omitempty"` // models only
-	Model    string `json:"model,omitempty"`
+	ID              string `json:"id"`
+	Provider        string `json:"provider,omitempty"` // models only
+	Model           string `json:"model,omitempty"`
+	ProviderKeyID   string `json:"providerKeyId,omitempty"`
+	ProviderKeyName string `json:"providerKeyName,omitempty"`
 	// Host is where the calls went, when the provider's id has gone to
 	// more than one place, or elsewhere than the provider goes now: its
 	// calls are then told apart by it, not summed under the id.
@@ -270,6 +278,18 @@ type Group struct {
 	// Agent is the agent a session is of (sessions only).
 	Agent string `json:"agent,omitempty"`
 	Totals
+}
+
+// who is where a subscription's calls went as the account signed in
+// ("dee@example.com" of "api.factory.ai as dee@example.com"), the host
+// alone for the rest. The account is what tells one place from another: a
+// built-in moved onto its plugin sends the same account's calls through
+// plugin://…, which isn't another place.
+func who(where string) string {
+	if i := strings.LastIndex(where, " as "); i >= 0 {
+		return where[i+4:]
+	}
+	return where
 }
 
 // Point is one bar of the timeline.
@@ -284,10 +304,11 @@ type Summary struct {
 	Period Period    `json:"period"`
 	Since  time.Time `json:"since"`
 	Totals
-	Bucket string  `json:"bucket"` // hour | day | week
-	Series []Point `json:"series"`
-	Agents []Group `json:"agents"`
-	Models []Group `json:"models"`
+	Bucket       string  `json:"bucket"` // hour | day | week
+	Series       []Point `json:"series"`
+	Agents       []Group `json:"agents"`
+	Models       []Group `json:"models"`
+	ProviderKeys []Group `json:"providerKeys"`
 	// Sessions are the calls that named their session, by session.
 	Sessions []Group `json:"sessions"`
 }
@@ -308,7 +329,7 @@ func summarize(p Period, now time.Time, recs []Record) Summary {
 		}
 	}
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	s := Summary{Period: p, Bucket: "day", Agents: []Group{}, Models: []Group{}, Sessions: []Group{}, Series: []Point{}}
+	s := Summary{Period: p, Bucket: "day", Agents: []Group{}, Models: []Group{}, ProviderKeys: []Group{}, Sessions: []Group{}, Series: []Point{}}
 	var n int
 	switch p {
 	case Today:
@@ -360,15 +381,23 @@ func summarize(p Period, now time.Time, recs []Record) Summary {
 			if hosts[r.Provider] == nil {
 				hosts[r.Provider] = map[string]bool{}
 			}
-			hosts[r.Provider][r.Host] = true
+			hosts[r.Provider][who(r.Host)] = true
 		}
 	}
 	goesNow := map[string]string{}
+	keyProviders := map[string]bool{}
 	for _, p := range provider.All() {
-		goesNow[p.ID] = p.Where()
+		goesNow[p.ID] = who(p.Where())
+		keyProviders[p.ID] = p.Account == nil && p.Key != ""
+	}
+	for _, r := range recs {
+		if r.ProviderKeyID != "" {
+			keyProviders[r.Provider] = true
+		}
 	}
 	agents := map[string]*Group{}
 	models := map[string]*Group{}
+	keys := map[string]*Group{}
 	sessions := map[string]*Group{}
 	for _, r := range recs {
 		t := r.Time.In(now.Location())
@@ -397,8 +426,8 @@ func summarize(p Period, now time.Time, recs []Record) Summary {
 		}
 		a.add(r, pr)
 		k, host := r.Provider+"/"+r.Model, ""
-		if r.Host != "" && (len(hosts[r.Provider]) > 1 || r.Host != goesNow[r.Provider]) {
-			k, host = k+" @ "+r.Host, r.Host
+		if w := who(r.Host); w != "" && (len(hosts[r.Provider]) > 1 || w != goesNow[r.Provider]) {
+			k, host = k+" @ "+w, w
 		}
 		m := models[k]
 		if m == nil {
@@ -406,6 +435,16 @@ func summarize(p Period, now time.Time, recs []Record) Summary {
 			models[k] = m
 		}
 		m.add(r, pr)
+		if keyProviders[r.Provider] {
+			id := r.Provider + "#" + r.ProviderKeyID
+			g := keys[id]
+			if g == nil {
+				g = &Group{ID: id, Provider: r.Provider, ProviderKeyID: r.ProviderKeyID}
+				keys[id] = g
+			}
+			g.ProviderKeyName = r.ProviderKeyName
+			g.add(r, pr)
+		}
 		if r.Session != "" {
 			g := sessions[id+"|"+r.Session]
 			if g == nil {
@@ -434,6 +473,10 @@ func summarize(p Period, now time.Time, recs []Record) Summary {
 	}
 	byTokens(s.Agents)
 	byTokens(s.Models)
+	for _, g := range keys {
+		s.ProviderKeys = append(s.ProviderKeys, *g)
+	}
+	byTokens(s.ProviderKeys)
 	for _, g := range sessions {
 		s.Sessions = append(s.Sessions, *g)
 	}
@@ -510,7 +553,7 @@ func LastSeen(agent string) time.Time {
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
 		var r Record
-		if json.Unmarshal(sc.Bytes(), &r) == nil && r.Agent == agent && r.Time.After(last) {
+		if json.Unmarshal(sc.Bytes(), &r) == nil && r.Agent == agent && r.Via == "" && r.Time.After(last) {
 			last = r.Time
 		}
 	}

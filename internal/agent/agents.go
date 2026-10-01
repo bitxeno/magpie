@@ -64,6 +64,7 @@ func All() []*Agent {
 		gemini(home),
 		agy(home),
 		opencode(home, cfg),
+		openChamber(home, cfg),
 		mimocode(home, cfg),
 		pi(home),
 		omo(home),
@@ -78,6 +79,8 @@ func All() []*Agent {
 		devin(home, cfg),
 		hermes(home),
 		kimi(home),
+		muse(cfg),
+		miniMax(home),
 		droid(home),
 		cline(home),
 		qoder(home),
@@ -233,7 +236,7 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 			// group's context (magpie group set … context=) never reaches
 			// it; an output of 0 is OpenCode's own default
 			if m.Context > 0 {
-				e["limit"] = map[string]any{"context": m.Context, "output": m.Output}
+				e["limit"] = map[string]any{"context": m.Context, "output": maxTokens(m)}
 			}
 			e["variants"] = openCodeVariants(m.Efforts)
 			ms[m.ID] = e
@@ -247,7 +250,15 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 			if window == 0 {
 				window = 200000
 			}
-			ms = append(ms, map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": 16384,
+			// without it Crush caps every reply at 16384 tokens, a model
+			// that can write more of them never asked for it; an output
+			// above the window is cut to it, as it is for every other
+			// agent magpie hands a limit to
+			tokens := maxTokens(m)
+			if tokens == 0 {
+				tokens = 16384
+			}
+			ms = append(ms, map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": tokens,
 				"can_reason": len(m.Efforts) > 0})
 		}
 		if ms == nil {
@@ -291,7 +302,7 @@ func magpieProviderJSONAt(shape, catalog, gw string) any {
 			// without it Pi caps every reply at 16384 tokens, a model
 			// that can write 128K included
 			if m.Output > 0 {
-				e["maxTokens"] = m.Output
+				e["maxTokens"] = maxTokens(m)
 			}
 			ms = append(ms, e)
 		}
@@ -376,27 +387,26 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 		}
 	}
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
+	// whether a model the file names, or one OpenChamber sends to the
+	// OpenCode it runs on this config, is one of magpie's: magpie's
+	// provider has to stay
+	onMagpie := func() bool {
+		return usesMagpie(get("model"), get("small_model")) || id == "opencode" && openChamberOnMagpie()
+	}
 	set := func(key string) func(string) error {
 		return func(v string) error {
 			if v == "" {
 				if err := edit.DelJSON(path, key); err != nil {
 					return err
 				}
-				if usesMagpie(get("model"), get("small_model")) {
+				if onMagpie() {
 					return nil
 				}
 				return edit.DelJSON(path, "provider."+magpieID)
 			}
-			if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
-				// a provider of the file's own already sends this model to
-				// magpie: name it there, rather than add a second list of
-				// the same models under magpie's
-				if own := ownGatewayProvider(path, ref); own != "" {
-					return edit.SetJSON(path, edit.KV{Path: key, Value: own + "/" + ref})
-				}
-				if err := edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: provider()}); err != nil {
-					return err
-				}
+			v, err := openCodeRef(path, id, v)
+			if err != nil {
+				return err
 			}
 			return edit.SetJSON(path, edit.KV{Path: key, Value: v})
 		}
@@ -415,7 +425,7 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 		Sync: func() error {
 			// a model of magpie's chosen, but its provider gone from the
 			// file: put it back, or the agent has nothing to send it to
-			if _, ok := edit.GetJSON(path, "provider."+magpieID); !ok && usesMagpie(get("model"), get("small_model")) {
+			if _, ok := edit.GetJSON(path, "provider."+magpieID); !ok && onMagpie() {
 				return edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: provider()})
 			}
 			return syncJSON(path, "provider."+magpieID, provider)
@@ -425,6 +435,22 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 			{Key: "small", Label: "small", Get: jsonGet(path, "small_model"), Set: set("small_model"), Options: opts("small")},
 		},
 	}
+}
+
+// openCodeRef is the value that makes the OpenCode config at path (agent
+// id's, whose catalog magpie's provider there lists) send model v. One of
+// magpie's goes to a provider of the file's own that already sends it to
+// magpie, named there rather than in a second list of the same models, else
+// to magpie's provider, put in the file; any other is v as it is.
+func openCodeRef(path, id, v string) (string, error) {
+	ref, ok := strings.CutPrefix(v, magpieID+"/")
+	if !ok || !isMagpie(ref) {
+		return v, nil
+	}
+	if own := ownGatewayProvider(path, ref); own != "" {
+		return own + "/" + ref, nil
+	}
+	return v, edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: magpieProviderJSONFor("opencode", id)})
 }
 
 // ownGatewayProvider is the provider in an OpenCode config, other than
@@ -471,8 +497,22 @@ func sameGateway(base string) bool {
 
 func opencode(home, cfg string) *Agent {
 	return openCodeLike("opencode", "OpenCode", "opencode", "opencode",
-		filepath.Join(cfg, "opencode"), filepath.Join(home, ".local", "share", "opencode", "auth.json"),
+		openCodeDir(cfg), filepath.Join(home, ".local", "share", "opencode", "auth.json"),
 		[]string{"opencode"}, "oc")
+}
+
+// openCodeDir is the folder OpenCode reads its user config from:
+// $OPENCODE_CONFIG_DIR when set, else $XDG_CONFIG_HOME/opencode (cfg).
+// OpenCode 2, the one OpenChamber bundles (#321), reads that folder in place
+// of the other; OpenCode 1 reads both, the variable's last, so what magpie
+// writes there wins in either.
+func openCodeDir(cfg string) string {
+	if d := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG_DIR")); d != "" {
+		if abs, err := filepath.Abs(d); err == nil {
+			return abs
+		}
+	}
+	return filepath.Join(cfg, "opencode")
 }
 
 // mimocode is MiMo Code, the CLI, and the engine inside Xiaomi MiMo, the
@@ -494,9 +534,34 @@ func pi(home string) *Agent { return piIn(here(home)) }
 // distro's (see wsl.go), its models.json naming the gateway as it reaches
 // it from there.
 func piIn(at place) *Agent {
-	a := piLike(at, "pi", "Pi", filepath.Join(at.home, ".pi", "agent"))
+	a := piLike(at, "pi", "Pi", piDir(at))
 	a.UA = []string{"pi-"}
 	return a
+}
+
+// piDir is Pi's agent folder at a place: PI_CODING_AGENT_DIR's when set,
+// "~" in it standing for home, else ~/.pi/agent (config.js, getAgentDir).
+// A relative one is Pi's working directory's, which magpie can't know, so
+// it is not taken; nor this machine's variable for a WSL distro's Pi.
+func piDir(at place) string {
+	if at.spell == nil {
+		if d := homeDir(at.home, os.Getenv("PI_CODING_AGENT_DIR")); d != "" {
+			return d
+		}
+	}
+	return filepath.Join(at.home, ".pi", "agent")
+}
+
+// homeDir is the folder an agent's variable names, "~" and "~/…" expanded
+// to home as Pi does; "" when it is empty or relative.
+func homeDir(home, d string) string {
+	if d == "~" || strings.HasPrefix(d, "~/") || (runtime.GOOS == "windows" && strings.HasPrefix(d, `~\`)) {
+		d = filepath.Join(home, d[1:])
+	}
+	if !filepath.IsAbs(d) {
+		return ""
+	}
+	return filepath.Clean(d)
 }
 
 // piLike is Pi, or a fork of it that keeps Pi's settings.json and

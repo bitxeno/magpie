@@ -28,6 +28,7 @@ type Route struct {
 	Time     time.Time `json:"time"`
 	Agent    string    `json:"agent"`
 	Kind     string    `json:"kind,omitempty"`   // what the call is for, as Call's
+	For      *CallFor  `json:"for,omitempty"`    // the request it was made for, as Call's
 	Model    string    `json:"model"`            // as the agent asked
 	Effort   string    `json:"effort,omitempty"` // the reasoning the agent asked for; "" for none
 	Provider string    `json:"provider"`         // the provider the model resolved to
@@ -37,6 +38,7 @@ type Route struct {
 	// one that went first, each as it decided
 	Nested   []NestedRule `json:"nested,omitempty"`
 	Affinity *Affinity    `json:"affinity,omitempty"` // its conversation, and whether it stayed put
+	Pinned   string       `json:"pinned,omitempty"`   // the account AccountHeader named: only it was tried
 	Order    []Weighed    `json:"order"`              // who was to try it, first first
 	Left     []Weighed    `json:"left,omitempty"`
 	Tries    []Try        `json:"tries"`
@@ -52,9 +54,11 @@ type Route struct {
 	TTFT      int64 `json:"ttft,omitempty"`
 	FirstText int64 `json:"firstText,omitempty"`
 	// Served: the model the reply says answered, as the last try has it;
-	// Swapped: another than the one that try asked for
+	// Swapped: another than the one that try asked for; Routed: that try
+	// asked another magpie's routing group, and Served is its member
 	Served  string `json:"served,omitempty"`
 	Swapped bool   `json:"swapped,omitempty"`
+	Routed  bool   `json:"routed,omitempty"`
 }
 
 // GroupRef is the routing group a request asked for.
@@ -162,13 +166,27 @@ type Try struct {
 	TTFT      int64 `json:"ttft,omitempty"`
 	FirstText int64 `json:"firstText,omitempty"`
 	// Served: the model its reply said answered, when it named one;
-	// Swapped: another model than Model, not just its dated name
+	// Swapped: another model than Model, not just its dated name; Routed:
+	// Model is another magpie's routing group, and Served the member it
+	// routed to (usage.GroupRouted)
 	Served  string `json:"served,omitempty"`
 	Swapped bool   `json:"swapped,omitempty"`
+	Routed  bool   `json:"routed,omitempty"`
 	Fail    string `json:"fail,omitempty"` // why it failed, as rest tells it
 	Error   string `json:"error,omitempty"`
 	Rest    *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
 	Again   int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Reset: its week used up and nobody else left, one of the account's
+	// Codex resets was spent by itself (the user's setting) — on Who, and
+	// what spending it did — and the request asked again
+	Reset *AutoReset `json:"reset,omitempty"`
+}
+
+// AutoReset is a Codex or Claude reset spent by itself, on Who's account.
+type AutoReset struct {
+	Who   string `json:"who"`
+	Text  string `json:"text"`
+	Agent string `json:"agent,omitempty"` // "claude" for a Claude account's; Codex's otherwise
 }
 
 type planned struct {
@@ -181,6 +199,11 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	switch {
 	case c.p.Account != nil:
 		w.Kind, w.Who, w.Agent, w.Plan = "account", c.p.Account.User, c.p.Account.Agent, c.p.Account.Plan
+		if w.Agent == "plugin" {
+			// a plugin's account is told as its provider's: a moved Grok's
+			// plan reads as the built-in's did
+			w.Agent = c.p.ID
+		}
 	case c.rest != p.ID:
 		w.Kind, w.Who = "key", c.p.KeyName
 		if w.Who == "" {

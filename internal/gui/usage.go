@@ -198,7 +198,12 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 	// keys' balances come from the
 	// vendors, which can be slow or unreachable, so the page asks for them
 	// apart from the local log.
+	// ?asked=1 is the user opening or refreshing the page: Claude Code's
+	// own /usage is run at once (provider.AskClaudeUsage).
 	mux.HandleFunc("GET /api/usage/quotas", func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("asked") != "" {
+			provider.AskClaudeUsage()
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 		defer cancel()
 		writeJSON(rw, provider.Quotas(ctx))
