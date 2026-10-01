@@ -17,6 +17,9 @@ on:
 
 jobs:
   trigger-release:
+    # The dispatch secret lives only upstream; forks release on their own
+    # (see manual-release.yml), so a v* tag there must not fire this.
+    if: github.repository == 'yetone/magpie'
     runs-on: ubuntu-latest
 
     steps:

@@ -1,0 +1,99 @@
+name: Publish release
+
+# Builds the terminal-only magpie for every platform (make release-cli) and
+# publishes the binaries to a GitHub Release in this repo. No tags or
+# secrets needed up front — the tag is created with the release.
+#
+# Triggers: every push to main (reuses the latest release version and
+# overwrites it), or hand-run from Actions with an explicit version.
+#
+# The v* tag flow in release.yml stays upstream-only: it dispatches to
+# yetone/magpie-releases, whose signing secrets live only there.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.1.0 or v0.1.0; empty = reuse the latest release version)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        required: false
+        default: false
+        type: boolean
+      overwrite:
+        description: 'Delete an existing release/tag with this version first (for re-runs)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.version }}"
+          V="${V#v}"
+          if [[ -z "$V" ]]; then
+            V="$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            V="${V#v}"
+            if [[ -z "$V" ]]; then
+              echo "::error::no version input and no existing release to reuse (nothing published yet — run once with an explicit version)"
+              exit 1
+            fi
+            echo "Reusing latest release version: v$V"
+          fi
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like 0.1.0 (got '$V')"
+            exit 1
+          fi
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      - name: Delete existing release and tag
+        if: inputs.overwrite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${{ steps.version.outputs.tag }}" --cleanup-tag -y || true
+
+      - name: Build CLI binaries
+        run: make release-cli VERSION=${{ steps.version.outputs.tag }}
+
+      - name: Checksums
+        run: |
+          (cd dist && sha256sum magpie-cli-* > SHA256SUMS.txt)
+          ls -la dist
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FLAGS=()
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then FLAGS+=(--prerelease); fi
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            "${FLAGS[@]}" \
+            dist/magpie-cli-* dist/SHA256SUMS.txt
