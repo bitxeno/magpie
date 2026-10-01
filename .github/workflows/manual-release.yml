@@ -4,15 +4,14 @@ name: Publish release
 # publishes the binaries to a GitHub Release in this repo. No tags or
 # secrets needed up front — the tag is created with the release.
 #
-# Triggers: every push to main (reuses the latest release version and
-# overwrites it), or hand-run from Actions with an explicit version.
+# Triggers: every push to any branch (reuses the latest release version
+# and overwrites it), or hand-run from Actions with an explicit version.
 #
 # The v* tag flow in release.yml stays upstream-only: it dispatches to
 # yetone/magpie-releases, whose signing secrets live only there.
 
 on:
   push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       version:
