@@ -1424,6 +1424,15 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// a backend that only streams gets a non-streaming request translated
 	// (the provider is always streamed on that path) rather than relayed
 	relay := slices.Contains(s.usable(p, model), from) && (p.Account == nil || !p.Account.Stream || streamOf(body))
+	if relay && p.IsOpenCodeFree() && (from == provider.Chat || from == provider.Responses) && !streamOf(body) {
+		// the free lane's gate turns away non-streaming requests (403
+		// FreeTierError): translate streams upstream and answers the
+		// client whole, as for backends that only stream. Prepare adds
+		// the gate's stub tools here — the translate path never applies
+		// it, and without declared tools the gate refuses even streams.
+		relay = false
+		body = p.Prepare(body)
+	}
 	// a web search offered is done by the provider, or by magpie for it,
 	// which a relayed request can't
 	if relay && searchAsked(from, body) && (from == provider.Chat || !searchesItself(p, from)) {

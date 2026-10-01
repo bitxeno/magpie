@@ -1070,7 +1070,9 @@ func TestOpenCodeGetsConversationSession(t *testing.T) {
 func TestOpenCodeFreeLaneDisguise(t *testing.T) {
 	f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
 	up := setup(t, provider.Chat, f)
-	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	// Streaming: the relayed path, where the disguise headers are asserted
+	// (a non-streaming request takes the translate path instead).
+	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}],"stream":true}`
 	// The anonymous free lane (key "public"): CLI-identical headers.
 	for _, key := range []string{"public"} {
 		if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: key, Models: []string{"m1"}, Chat: "http://opencode.ai/zen/v1"}); err != nil {
@@ -1111,6 +1113,45 @@ func TestOpenCodeFreeLaneDisguise(t *testing.T) {
 		if key == "" && f.head.Get("Authorization") != "Bearer public" {
 			t.Errorf("empty key: auth %q", f.head.Get("Authorization"))
 		}
+	}
+}
+
+// The free lane's gate turns away non-streaming requests: one is streamed
+// upstream (with the gate's stub tools) and the client answered whole.
+func TestFreeLaneNonStreamTranslated(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`,
+		`data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+		`data: [DONE]`)}
+	up := setup(t, provider.Chat, f)
+	f.refuse = func(got []byte) (int, string) {
+		if !strings.Contains(string(got), `"stream":true`) || !strings.Contains(string(got), `"shell"`) {
+			return 403, `{"type":"error","error":{"type":"FreeTierError","message":"can only be used from within OpenCode"}}`
+		}
+		return 0, ""
+	}
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "public", Models: []string{"m1"}, Chat: "http://opencode.ai/zen/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	addr := strings.TrimPrefix(up.URL, "http://")
+	s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m1","messages":[{"role":"user","content":"hi"}]}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	if out := rec.Body.String(); strings.Contains(out, "data:") || !strings.Contains(out, "hello") || !strings.Contains(out, "chat.completion") {
+		t.Fatalf("client got %s", out)
+	}
+	if got := string(f.got); !strings.Contains(got, `"stream":true`) || !strings.Contains(got, `"shell"`) {
+		t.Fatalf("upstream got %s", got)
+	}
+	if ses := f.head.Get("x-opencode-session"); !strings.HasPrefix(ses, "ses_") {
+		t.Fatalf("session %q", ses)
 	}
 }
 
