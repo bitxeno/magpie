@@ -190,6 +190,11 @@ func (p Provider) Prepare(body []byte) []byte {
 	if p.Account != nil && p.Account.body != nil {
 		return p.Account.body(body)
 	}
+	// the free lane's gate wants shell/read tools declared (see
+	// opencode_free.go)
+	if p.IsOpenCodeFree() {
+		return freeLanePrepare(body)
+	}
 	return body
 }
 

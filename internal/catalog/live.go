@@ -16,6 +16,13 @@ import (
 	"github.com/yetone/magpie/internal/filememo"
 )
 
+// opencodeUserAgent mirrors provider.OpenCodeUserAgent (kept local: catalog
+// cannot import provider, which imports catalog). Keep the version in sync:
+// the CLI sends a bare "opencode/<version>", no platform suffix.
+func opencodeUserAgent() string {
+	return "opencode/1.18.30"
+}
+
 // A vendor's own /models endpoint is the truth about what it serves today;
 // models.dev lags and keeps legacy names around. magpie asks the vendor when
 // it has a key, remembers the answer next to the models.dev cache, and lets
@@ -222,6 +229,15 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 		req.Header.Set("x-api-key", key)
+	}
+	if strings.Contains(strings.ToLower(url), "opencode.ai") && (key == "" || key == "public") {
+		// Zen's anonymous lane expects CLI-identical headers even on the
+		// model list (see dsh-opencode-free-provider's fetchZenModels).
+		req.Header.Set("User-Agent", opencodeUserAgent())
+		req.Header.Set("x-opencode-client", "cli")
+		if key == "" {
+			req.Header.Set("Authorization", "Bearer public")
+		}
 	}
 	if anthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")

@@ -1325,7 +1325,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 			req.Header.Del("anthropic-beta")
 		}
 	}
-	if p.IsOpenCode() {
+	if p.IsOpenCodeFree() {
+		// The anonymous free lane answers anything that doesn't look like
+		// the CLI with 403 FreeTierError ("can only be used from within
+		// OpenCode"). Send the CLI-identical header set.
+		p.DisguiseRequest(req, body)
+	} else if p.IsOpenCode() {
 		req.Header.Set("x-opencode-session", conversationID(in, body))
 	}
 	if p.Account != nil && p.Account.Agent == "codex" {
@@ -1343,6 +1348,12 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	}
 	if err := p.Sign(ctx, req, to, body); err != nil {
 		return nil, err
+	}
+	if p.IsOpenCodeFree() {
+		// Sign applies the user's own headers after auth, which could have
+		// clobbered the CLI shape; re-assert it so the free tier stays
+		// reachable.
+		p.DisguiseRequest(req, body)
 	}
 	return p.Do(s.client, req)
 }

@@ -54,6 +54,10 @@ func (p Provider) Test(ctx context.Context) []Result {
 // tiny is the smallest request for model on proto's endpoint, streamed
 // to a backend that only streams.
 func tiny(q Provider, proto Protocol, model string) (url, body string) {
+	// the free lane's gate wants a streamed request with shell/read tools
+	if q.IsOpenCodeFree() && (proto == Chat || proto == Responses) {
+		return freeLaneTiny(q, proto, model)
+	}
 	url, body = tinyBody(q, proto, model)
 	if q.Account != nil && q.Account.Stream && body != "" {
 		body = strings.TrimSuffix(body, "}") + `,"stream":true}`
@@ -279,12 +283,17 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	if p.IsOpenCode() {
+	if p.IsOpenCodeFree() {
+		p.DisguiseRequest(req, body)
+	} else if p.IsOpenCode() {
 		req.Header.Set("x-opencode-session", "magpie-test-"+randomUUID())
 	}
 	if err := p.Sign(ctx, req, proto, body); err != nil {
 		r.Error = err.Error()
 		return r
+	}
+	if p.IsOpenCodeFree() {
+		p.DisguiseRequest(req, body)
 	}
 	start := time.Now()
 	res, err := p.Do(http.DefaultClient, req)

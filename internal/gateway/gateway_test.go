@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1063,6 +1064,53 @@ func TestOpenCodeGetsConversationSession(t *testing.T) {
 	}
 	if a, b := send(nil), send(nil); a == "" || a != b {
 		t.Errorf("derived session: %q %q", a, b)
+	}
+}
+
+func TestOpenCodeFreeLaneDisguise(t *testing.T) {
+	f := &fake{t: t, ctype: "application/json", reply: `{"id":"c1","choices":[]}`}
+	up := setup(t, provider.Chat, f)
+	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	// The anonymous free lane (key "public"): CLI-identical headers.
+	for _, key := range []string{"public"} {
+		if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: key, Models: []string{"m1"}, Chat: "http://opencode.ai/zen/v1"}); err != nil {
+			t.Fatal(err)
+		}
+		s := New()
+		addr := strings.TrimPrefix(up.URL, "http://")
+		s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		}}}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("key %q: %d %s", key, rec.Code, rec.Body.String())
+		}
+		shape := regexp.MustCompile(`^[a-z]+_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+		ses := f.head.Get("x-opencode-session")
+		if !shape.MatchString(ses) || !strings.HasPrefix(ses, "ses_") {
+			t.Errorf("key %q: session shape %q", key, ses)
+		}
+		if got := f.head.Get("x-opencode-request"); !shape.MatchString(got) || !strings.HasPrefix(got, "msg_") {
+			t.Errorf("key %q: request shape %q", key, got)
+		}
+		if got := f.head.Get("x-opencode-client"); got != "cli" {
+			t.Errorf("key %q: client %q", key, got)
+		}
+		if got := f.head.Get("User-Agent"); got != "opencode/"+provider.OpenCodeCLIVersion {
+			t.Errorf("key %q: UA %q", key, got)
+		}
+		// Exactly the CLI's set for opencode providers: no affinity,
+		// session-id or project headers — those belong to other lanes.
+		for _, h := range []string{"x-session-affinity", "X-Session-Id", "x-opencode-session-id", "x-opencode-project"} {
+			if got := f.head.Get(h); got != "" {
+				t.Errorf("key %q: %s must not ride the Zen path: %q", key, h, got)
+			}
+		}
+		if key == "" && f.head.Get("Authorization") != "Bearer public" {
+			t.Errorf("empty key: auth %q", f.head.Get("Authorization"))
+		}
 	}
 }
 
