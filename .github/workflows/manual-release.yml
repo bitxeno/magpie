@@ -56,13 +56,19 @@ jobs:
           V="${{ inputs.version }}"
           V="${V#v}"
           if [[ -z "$V" ]]; then
-            V="$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
-            V="${V#v}"
+            # Push runs carry no input: reuse the latest release version.
+            # The API's 404 payload lands on stdout, so only a
+            # version-shaped answer is accepted; with no releases yet the
+            # first version is bootstrapped (override with an explicit
+            # version input).
+            RAW="$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            V="$(printf '%s' "$RAW" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
             if [[ -z "$V" ]]; then
-              echo "::error::no version input and no existing release to reuse (nothing published yet — run once with an explicit version)"
-              exit 1
+              V="0.1.0"
+              echo "No releases yet — bootstrapping first version: v$V"
+            else
+              echo "Reusing latest release version: v$V"
             fi
-            echo "Reusing latest release version: v$V"
           fi
           if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version must look like 0.1.0 (got '$V')"
