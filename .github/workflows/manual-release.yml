@@ -77,7 +77,9 @@ jobs:
           echo "tag=v$V" >> "$GITHUB_OUTPUT"
 
       - name: Delete existing release and tag
-        if: inputs.overwrite
+        # inputs.* defaults only apply to hand runs; on push the context is
+        # empty, so push runs (which always republish) must match too.
+        if: github.event_name == 'push' || inputs.overwrite
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
